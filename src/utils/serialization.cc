@@ -42,7 +42,7 @@ bool Unserializer::Get(uint8_t* data, size_t size) {
 
 bool Unserializer::Get(std::vector<uint8_t>& data) {
   size_t size;
-  if (!Get(size)) return false;
+  if (!Get(size) || size > size_) return false;
   data.resize(size);
   return Get(data.data(), data.size());
 }

@@ -72,6 +72,7 @@ bool Packet::GetHeader(Unserializer& u) {
 
 bool Packet::Get(Unserializer& u) {
   if (!GetHeader(u)) return false;
+  if (header.data_size > kMaxPacketSize) return false;
   data.resize(header.data_size);
   return u.Get(data.data(), data.size());
 }

@@ -49,6 +49,8 @@ class Connection : public std::enable_shared_from_this<Connection> {
 
  private:
   constexpr static uint16_t kTimeoutSeconds = 10;
+  // packet data is read (and its buffer grown) at most this much at a time
+  constexpr static size_t kReadChunkSize = 1024 * 1024;
 
   // active connection
   Connection(ConnectionOwner&, ba::io_context&);
@@ -56,6 +58,8 @@ class Connection : public std::enable_shared_from_this<Connection> {
   Connection(ConnectionOwner&, ba::io_context&, bi::tcp::socket&&);
 
   void StartWrite();
+  void ReadData();
+  void OnPacketRead();
   bool CheckRead(const boost::system::error_code&, size_t expected, size_t len);
   void Drop(DropReason);
 

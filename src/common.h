@@ -11,13 +11,13 @@
 #pragma warning(push, 0)
 #endif
 
-#include "third-party/base58.h"
+#include <arith_uint256.h>
+#include <base58.h>
 
 #if defined(_MSC_VER)
 #pragma warning(pop)
 #endif
 
-#include "../include/p2p_network.h"
 #include "types.h"
 #include "utils/serialization.h"
 
@@ -31,9 +31,18 @@ constexpr const char* kAllInterfaces = "0.0.0.0";
 constexpr const char* kBanFileName = "banlist.dat";
 constexpr const char* kDbPath = "p2p_db";
 
+// The largest data_size a packet header may announce. The receiver allocates what the header
+// announces before reading the data, so a larger value drops the connection instead
+// (Connection::StartRead). Well above every packet the node sends.
+constexpr size_t kMaxPacketSize = size_t(256) * 1024 * 1024;
+// The largest data_size of the first packet of a connection, the registration (Network's RegData:
+// address type, an IPv4 or IPv6 address and a port, 7 or 19 bytes).
+constexpr size_t kMaxRegistrationSize = 64;
+
 namespace ba = boost::asio;
 namespace bi = ba::ip;
 
+using NodeId = arith_uint256;
 using DeadlineTimer = ba::deadline_timer;
 
 struct NodeEntrance {

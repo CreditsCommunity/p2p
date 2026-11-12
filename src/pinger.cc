@@ -7,6 +7,10 @@ namespace net {
 RoutingTable::Pinger::Pinger(RoutingTable& rt) : routing_table_(rt) {}
 
 RoutingTable::Pinger::~Pinger() {
+  Join();
+}
+
+void RoutingTable::Pinger::Join() {
   if (ping_thread_.joinable()) {
     ping_thread_.join();
   }
@@ -87,7 +91,7 @@ void RoutingTable::Pinger::SendPing(const NodeEntrance& target, KBucket& bucket,
                           routing_table_.NotifyHost(target, RoutingTableEventType::kNodeRemoved);
                         }
 
-                        if (replacer && !bucket.Exists(replacer->id)) {
+                        if (replacer) {
                           bucket.AddNode(*replacer);
                           routing_table_.total_nodes_++;
                           routing_table_.NotifyHost(*replacer, RoutingTableEventType::kNodeAdded);
@@ -103,8 +107,8 @@ void RoutingTable::Pinger::SendPing(const NodeEntrance& target, KBucket& bucket,
   timer->async_wait(std::move(callback));
 }
 
-void RoutingTable::Pinger::CheckPingResponce(const KademliaDatagram& d) {
+bool RoutingTable::Pinger::CheckPingResponce(const KademliaDatagram& d) {
   Guard g(ping_mux_);
-  ping_sent_.erase(d.node_from.id);
+  return ping_sent_.erase(d.node_from.id) > 0;
 }
 } // namespace net

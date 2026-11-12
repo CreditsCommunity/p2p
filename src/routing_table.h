@@ -13,7 +13,6 @@
 #include <vector>
 
 #include "common.h"
-#include "database.h"
 #include "k_bucket.h"
 #include "kademlia_datagram.h"
 #include "udp.h"
@@ -33,8 +32,6 @@ class RoutingTableEventHandler {
   virtual ~RoutingTableEventHandler() = default;
   virtual void HandleRoutTableEvent(const NodeEntrance&, RoutingTableEventType) = 0;
   virtual bool IsEndpointBanned(const bi::address& addr, uint16_t port) = 0;
-  virtual void OnFragmentFound(const FragmentId& id, ByteVector&& fragment) = 0;
-  virtual void OnFragmentNotFound(const FragmentId& id) = 0;
 };
 
 class RoutingTable : public UdpSocketEventHandler {
@@ -42,6 +39,9 @@ class RoutingTable : public UdpSocketEventHandler {
   RoutingTable(ba::io_context& io, RoutingTableEventHandler& host);
   ~RoutingTable() override;
 
+  // Ends the pinger and explorer threads and closes the UDP socket. Called once the io_context
+  // has stopped and its threads have ended (~Host), so that nothing else uses the socket.
+  // Idempotent; the destructor calls it too.
   void Stop();
 
   // starts lookup if not started yet
@@ -53,10 +53,6 @@ class RoutingTable : public UdpSocketEventHandler {
   void GetKnownNodes(std::vector<NodeEntrance>&);
 
   std::vector<NodeEntrance> GetBroadcastList(const NodeId&);
-
-  static constexpr auto GetMaxFragmentSize() { return kMaxFragmentSize; }
-  void StoreFragment(const FragmentId&, ByteVector&&);
-  void FindFragment(const FragmentId&);
 
   void UpdateTcpPort(const NodeId&, uint16_t port);
 
@@ -73,7 +69,6 @@ class RoutingTable : public UdpSocketEventHandler {
 
  private:
   static constexpr uint16_t kMaxDatagramSize = 1472; // 1500(ethernet payload) - 20(ip header) - 8(udp header)
-  static constexpr uint16_t kMaxFragmentSize = 1350;
 
   // k should be chosen such that any given k nodes
   // are very unlikely to fail within an hour of each other
@@ -82,7 +77,7 @@ class RoutingTable : public UdpSocketEventHandler {
   // if kBroadcastReplication == k, topology based broadcast becomes flooding;
   // if it equals to 1, it takes logN time to spread a message through network
   // but whole subtrees may not receive the message
-  static constexpr uint8_t kBroadcastReplication = 3;
+  static constexpr uint8_t kBroadcastReplication = 5;
 
   static constexpr uint8_t kMaxPingsBeforeRemove = 3;
   static constexpr std::chrono::seconds kPingExpirationSeconds{8};
@@ -97,8 +92,11 @@ class RoutingTable : public UdpSocketEventHandler {
 
   uint16_t KBucketIndex(const NodeId& id) const noexcept;
 
-  void UpdateKBuckets(const NodeEntrance&);
-  void UpdateKBuckets(const std::vector<NodeEntrance>&);
+  // Adds the sender of a direct datagram, whose endpoint CheckEndpoint matched, or promotes it.
+  // refresh_user_data: the datagram answers a ping of ours (and carried user data), so the
+  // sender's entry takes its user data. Only for that sender: a node listed by another one
+  // (FindNode replies) is never written here.
+  void UpdateKBuckets(const NodeEntrance& sender, bool refresh_user_data);
 
   void OnNodeFound(const NodeEntrance&);
   void OnNodeNotFound(const NodeId&);
@@ -118,6 +116,7 @@ class RoutingTable : public UdpSocketEventHandler {
     ~NetExplorer();
 
     void Start(std::future<void>&& stop_condition);
+    void Join();
     void Find(const NodeId&, const std::vector<NodeEntrance>& find_list);
     void CheckFindNodeResponce(const KademliaDatagram&);
     void GetKnownNodes(std::vector<NodeEntrance>&);
@@ -154,9 +153,11 @@ class RoutingTable : public UdpSocketEventHandler {
     ~Pinger();
 
     void Start(std::future<void>&& stop_condition);
+    void Join();
     void SendPing(const NodeEntrance& target, KBucket& bucket,
                   std::shared_ptr<NodeEntrance> replacer = nullptr);
-    void CheckPingResponce(const KademliaDatagram&);
+    // true when the response answers an outstanding ping of ours
+    bool CheckPingResponce(const KademliaDatagram&);
 
    private:
     void PingRoutine(std::future<void>&&);
@@ -166,54 +167,6 @@ class RoutingTable : public UdpSocketEventHandler {
 
     Mutex ping_mux_;
     std::unordered_map<NodeId, uint8_t> ping_sent_;
-  };
-
-  class FragmentCollector {
-   public:
-    FragmentCollector(RoutingTable&);
-    void Stop();
-
-    void FindFragment(const FragmentId&);
-    bool StoreFragment(const FragmentId&, ByteVector&&, bool remove_own = false);
-
-    void HandleFindFragment(const KademliaDatagram&);
-    void HandleStoreFragment(const KademliaDatagram&);
-    void HandleFragmentFound(KademliaDatagram&);
-    void HandleFragmentNotFound(const KademliaDatagram&);
-
-   private:
-    void AddToRequired(const FragmentId&);
-    bool RemoveFromRequired(const FragmentId&);
-    void AddToRequiredNetwork(const FragmentId&);
-    bool RemoveFromRequiredNetwork(const FragmentId&);
-    void LookupRoutine();
-    void Find(const FragmentId&);
-    bool ExistsInDb(const FragmentId&, ByteVector&);
-    void StartFindInNetwork(const FragmentId&);
-    void StartLookupTimer(const FragmentId&);
-    void StoreInDb(const FragmentId&, const ByteVector&);
-    void RemoveFromDb(const FragmentId&);
-    void ReplicationRoutine();
-
-    static constexpr std::chrono::seconds kReplicationInterval{60 * 60};
-
-    RoutingTable& routing_table_;
-    Database db_;
-
-    std::condition_variable cv_;
-    std::atomic<bool> stop_flag_ = false;
-    std::thread lookup_thread_;
-    std::thread replication_thread_;
-    std::condition_variable cv_rep_;
-
-    Mutex mux_;
-    std::unordered_set<FragmentId> required_;
-
-    Mutex n_mux_;
-    std::unordered_map<FragmentId, std::unordered_set<NodeId>> net_required_;
-
-    Mutex s_mux_;
-    std::unordered_map<FragmentId, std::chrono::steady_clock::time_point> stored_fragments_;
   };
 
   const NodeEntrance host_data_;
@@ -229,10 +182,15 @@ class RoutingTable : public UdpSocketEventHandler {
 
   Pinger pinger_;
   NetExplorer explorer_;
-  FragmentCollector collector_;
 
   std::promise<void> pinger_stopper_;
   std::promise<void> discovery_stopper_;
+  std::atomic<bool> stopped_{false};
+
+  // NotifyHost threads still running (Stop waits for them, see there)
+  Mutex notify_mux_;
+  std::condition_variable notify_cv_;
+  size_t notify_running_ = 0;
 };
 
 inline NodeId RoutingTable::Distance(const NodeId& a, const NodeId& b) {

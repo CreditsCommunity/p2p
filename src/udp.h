@@ -56,7 +56,9 @@ class UdpSocket : public std::enable_shared_from_this<UdpSocket<MaxDatagramSize>
 
   bool IsOpen() const noexcept { return !closed_; }
 
-  void Close() { CloseWithError(ba::error::connection_reset); }
+  // Closes the socket. The caller makes sure no other thread uses the socket at the same time
+  // (RoutingTable::Stop runs after the io_context has stopped and its threads have ended).
+  void Close() { CloseWithError(boost::system::error_code()); }
 
  private:
   UdpSocket(ba::io_context& io, const bi::udp::endpoint& ep, UdpSocketEventHandler& host)
@@ -142,7 +144,9 @@ void UdpSocket<MaxDatagramSize>::StartRead() {
             }
 
             if (len) {
-                host_.OnPacketReceived(recv_ep_, ByteVector(recv_buf_.begin(), recv_buf_.end()));
+                // only the bytes of this datagram, not the rest of the buffer (earlier datagrams)
+                len = std::min(len, recv_buf_.size());
+                host_.OnPacketReceived(recv_ep_, ByteVector(recv_buf_.begin(), recv_buf_.begin() + len));
             }
 
             StartRead();
@@ -206,7 +210,7 @@ void UdpSocket<MaxDatagramSize>::CloseWithError(const boost::system::error_code&
 
   boost::system::error_code erc;
   socket_.shutdown(bi::udp::socket::shutdown_both, erc);
-  socket_.close();
+  socket_.close(erc);
 
   if (was_closed) return;
 

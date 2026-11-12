@@ -16,9 +16,18 @@
 
 namespace net {
 
+// Host's owner must implement this interface
+class HostEventHandler {
+ public:
+  virtual ~HostEventHandler() = default;
+  virtual void OnMessageReceived(const NodeId& from, ByteVector&& message) = 0;
+  virtual void OnNodeDiscovered(const NodeId&) = 0;
+  virtual void OnNodeRemoved(const NodeId&) = 0;
+};
+
 class Host : public RoutingTableEventHandler, public BanManOwner, public ConnectionOwner {
  public:
-  Host(const Config&, EventHandler&);
+  Host(const Config&, HostEventHandler&);
   ~Host();
 
   void Run();
@@ -35,15 +44,10 @@ class Host : public RoutingTableEventHandler, public BanManOwner, public Connect
   void ClearBanList();
   void GetBanList(std::set<BanEntry>&) const;
 
-  std::vector<FragmentId> StoreValue(ByteVector&& value);
-  void FindFragment(const FragmentId&);
-
  protected:
   // RoutingTableEventHandler
   void HandleRoutTableEvent(const NodeEntrance&, RoutingTableEventType) override;
   bool IsEndpointBanned(const bi::address& addr, uint16_t port) override;
-  void OnFragmentFound(const FragmentId&, ByteVector&&) override;
-  void OnFragmentNotFound(const FragmentId&) override;
 
   // BanManOwner
   void OnIdBanned(const NodeId&) override;
@@ -84,7 +88,7 @@ class Host : public RoutingTableEventHandler, public BanManOwner, public Connect
 
   ba::io_context io_;
   bi::tcp::acceptor acceptor_;
-  EventHandler& event_handler_;
+  HostEventHandler& event_handler_;
   NodeId my_id_;
   std::shared_ptr<RoutingTable> routing_table_;
 

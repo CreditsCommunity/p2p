@@ -1,0 +1,72 @@
+# Build and install the library on Linux. There are no tests in this repository: the node's CI
+# (unit tests, three platforms, private test network) validates a commit once the node pins it.
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  BOOST_VERSION: 1.83.0
+  BOOST_SHA256: 6478edfe2f3305127cffe8caf73ea0176c53769f4bf1585be237eb30798c3b8e
+  BOOST_PREFIX: /home/runner/boost
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      # actions pinned by commit (tags can move)
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      # The library links Boost statically with a static runtime (Boost_USE_STATIC_RUNTIME),
+      # which distribution packages do not provide: Boost.System is built once and cached.
+      - name: Restore Boost
+        id: cache-boost
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: ${{ env.BOOST_PREFIX }}
+          key: boost-${{ env.BOOST_VERSION }}-system-static-rt-ubuntu-24.04-v1
+
+      - name: Build Boost
+        if: steps.cache-boost.outputs.cache-hit != 'true'
+        run: |
+          v=${BOOST_VERSION//./_}
+          curl -sSfL -o "$RUNNER_TEMP/boost.tar.bz2" "https://archives.boost.io/release/${BOOST_VERSION}/source/boost_${v}.tar.bz2"
+          echo "${BOOST_SHA256}  $RUNNER_TEMP/boost.tar.bz2" | sha256sum -c
+          tar xjf "$RUNNER_TEMP/boost.tar.bz2" -C "$RUNNER_TEMP"
+          cd "$RUNNER_TEMP/boost_${v}"
+          ./bootstrap.sh --with-libraries=system
+          ./b2 -j"$(nproc)" -d0 variant=release link=static runtime-link=static threading=multi \
+            cxxflags=-fPIC --layout=tagged install --prefix="${BOOST_PREFIX}"
+
+      - name: Save Boost
+        if: steps.cache-boost.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: ${{ env.BOOST_PREFIX }}
+          key: ${{ steps.cache-boost.outputs.cache-primary-key }}
+
+      # -include cstdint/cstddef: the vendored base58 relies on headers GCC 13 no longer
+      # includes transitively (the node's CI passes the same flags).
+      - name: Configure
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+            -DBoost_ROOT="${BOOST_PREFIX}" -DBoost_NO_SYSTEM_PATHS=ON \
+            -DCMAKE_CXX_FLAGS="-include cstdint -include cstddef" \
+            -DCMAKE_INSTALL_PREFIX="$RUNNER_TEMP/p2p-install"
+
+      - name: Build and install
+        run: cmake --build build -j"$(nproc)" --target install

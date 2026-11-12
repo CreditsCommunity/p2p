@@ -71,8 +71,6 @@ add_library(${PROJECT_NAME} STATIC
   src/connection.cc
   src/common.h
   src/common.cc
-  src/database.h
-  src/fragment_collector.cc
   src/host.h
   src/host.cc
   src/k_bucket.h
@@ -81,14 +79,11 @@ add_library(${PROJECT_NAME} STATIC
   src/net_explorer.cc
   src/network.h
   src/network.cc
-  src/p2p_network.cc
   src/pinger.cc
   src/routing_table.h
   src/routing_table.cc
   src/types.h
   src/udp.h
-  src/third-party/base58.h
-  src/third-party/base58.cc
   src/third-party/sha1.h
   src/third-party/sha1.cc
   src/third-party/UPnP.h
@@ -111,7 +106,7 @@ target_include_directories(${PROJECT_NAME} INTERFACE
 
 target_include_directories(${PROJECT_NAME} PUBLIC ${Boost_INCLUDE_DIRS})
 
-target_link_libraries(${PROJECT_NAME} ${Boost_LIBRARIES} easylogging libminiupnpc-static leveldb
+target_link_libraries(${PROJECT_NAME} ${Boost_LIBRARIES} bitcoin_utils easylogging libminiupnpc-static leveldb
   ${CMAKE_THREAD_LIBS_INIT})
 
 if(NOT MSVC)
@@ -120,5 +115,12 @@ else()
   target_compile_options(${PROJECT_NAME} PRIVATE /W4)
 endif()
 
-install(TARGETS ${PROJECT_NAME} easylogging libminiupnpc-static leveldb ARCHIVE DESTINATION lib)
-install(FILES include/p2p_network.h include/arith_uint256.h DESTINATION include)
+set_target_properties(${PROJECT_NAME} PROPERTIES PUBLIC_HEADER include/p2p_network.h)
+
+install(TARGETS ${PROJECT_NAME} bitcoin_utils easylogging libminiupnpc-static leveldb
+        LIBRARY
+          DESTINATION lib
+        ARCHIVE
+          DESTINATION lib
+        PUBLIC_HEADER
+          DESTINATION include)

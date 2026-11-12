@@ -8,6 +8,10 @@ RoutingTable::NetExplorer::NetExplorer(RoutingTable& rt, bool full_discovery)
     : routing_table_(rt), full_discovery_(full_discovery) {}
 
 RoutingTable::NetExplorer::~NetExplorer() {
+  Join();
+}
+
+void RoutingTable::NetExplorer::Join() {
   if (discovery_thread_.joinable()) {
     discovery_thread_.join();
   }

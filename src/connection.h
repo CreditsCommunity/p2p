@@ -39,7 +39,9 @@ class Connection : public std::enable_shared_from_this<Connection> {
   ~Connection() { Close(); }
   void Close();
   // closes without reporting anything to the owner: its handlers end at once (Host::Reset, for the
-  // dials still pending, which must not mark their peers unreachable)
+  // dials still pending, which must not mark their peers unreachable). Safe from any thread: the socket
+  // is closed on the io thread, and a buffer an async_write in flight uses is freed only by that
+  // write's handler
   void Abandon();
 
   void Send(Packet&&);

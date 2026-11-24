@@ -112,12 +112,19 @@ void Connection::Close() {
 void Connection::Abandon() {
   dropped_ = true;
   ClearSendQueue();
-  Close();
+  // the socket is closed on the io thread, like every other operation on it (Host::Reset runs on
+  // another thread); the handlers in flight then end, seeing the connection dropped
+  Ptr self(shared_from_this());
+  ba::post(socket_.get_executor(), [self]() { self->Close(); });
 }
 
 void Connection::ClearSendQueue() {
   Guard g(send_mux_);
-  send_queue_.clear();
+  // the front buffer may be the one an async_write in flight is sending: it stays until that write's
+  // handler runs (which then clears the queue, the connection being dropped)
+  if (send_queue_.size() > 1) {
+    send_queue_.erase(send_queue_.begin() + 1, send_queue_.end());
+  }
 }
 
 void Connection::Drop(DropReason reason) {
@@ -302,7 +309,9 @@ void Connection::StartWrite() {
   ba::async_write(socket_, ba::buffer(send_queue_[0]),
       [this, self](const boost::system::error_code& err, size_t /* written length */) {
         if (dropped_) {
-          ClearSendQueue();
+          // this write is over: nothing of the queue is in use any more
+          Guard g(send_mux_);
+          send_queue_.clear();
           return;
         }
         ResetTimer();
@@ -315,6 +324,7 @@ void Connection::StartWrite() {
         }
 
         Guard g(send_mux_);
+        if (send_queue_.empty()) return;
         send_queue_.pop_front();
 
         if (send_queue_.empty()) return;

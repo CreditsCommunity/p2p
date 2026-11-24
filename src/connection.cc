@@ -111,12 +111,20 @@ void Connection::Close() {
 
 void Connection::Abandon() {
   dropped_ = true;
+  ClearSendQueue();
   Close();
+}
+
+void Connection::ClearSendQueue() {
+  Guard g(send_mux_);
+  send_queue_.clear();
 }
 
 void Connection::Drop(DropReason reason) {
   if (dropped_) return;
   dropped_ = true;
+  // nothing is written any more: what waits would stay for the life of the object
+  ClearSendQueue();
 
   if (registation_passed_) {
     host_.OnConnectionDropped(remote_node_, active_, reason, this);
@@ -278,6 +286,8 @@ bool Connection::IsConnected() const {
 
 void Connection::Send(Packet&& pack) {
   Guard g(send_mux_);
+  // a dropped or abandoned connection writes nothing: queueing would only hold memory
+  if (dropped_) return;
   Serializer s;
   s.Put(pack);
   send_queue_.push_back(s.GetData());
@@ -292,6 +302,7 @@ void Connection::StartWrite() {
   ba::async_write(socket_, ba::buffer(send_queue_[0]),
       [this, self](const boost::system::error_code& err, size_t /* written length */) {
         if (dropped_) {
+          ClearSendQueue();
           return;
         }
         ResetTimer();

@@ -301,6 +301,9 @@ void Host::Reset() {
 
   size_t closed = 0;
   {
+    // conn_mux_ is held throughout (then pend_conn_mux_, the order OnConnected takes them in): a dial
+    // that registers meanwhile either is in connections_ already and is closed here, or finds itself
+    // abandoned in OnConnected and is never taken
     Guard g(conn_mux_);
     // their handlers end with an error and report the drop, which finds nothing left to erase
     for (auto& c : connections_) {
@@ -308,17 +311,18 @@ void Host::Reset() {
       ++closed;
     }
     connections_.clear();
-  }
-  std::unordered_map<NodeId, Connection::Ptr> dials;
-  {
-    Guard g(pend_conn_mux_);
-    pending_connections_.clear();
-    dials.swap(pending_dials_);
-  }
-  // the dials in flight end without a word: reported, a dial cut here would mark its peer unreachable
-  // for 120 s, right when the routing table looks it up again
-  for (auto& d : dials) {
-    d.second->Abandon();
+
+    std::unordered_map<NodeId, Connection::Ptr> dials;
+    {
+      Guard p(pend_conn_mux_);
+      pending_connections_.clear();
+      dials.swap(pending_dials_);
+    }
+    // the dials in flight end without a word: reported, a dial cut here would mark its peer
+    // unreachable for 120 s, right when the routing table looks it up again
+    for (auto& d : dials) {
+      d.second->Abandon();
+    }
   }
   {
     Guard g(send_mux_);
@@ -398,6 +402,24 @@ void Host::OnConnected(Packet&& conn_pack, Connection::Ptr new_conn) {
   const auto& remote_node = conn_pack.header.sender;
 
   Guard g(conn_mux_);
+  // abandoned by Reset (which holds conn_mux_ while it abandons the dials): never taken
+  if (new_conn->IsDropped()) {
+    LOG(DEBUG) << "Registration of an abandoned connection with " << IdToBase58(remote_node) << " ignored";
+    return;
+  }
+
+  // a dial answered by another node than the one dialled: not taken under the other id (the dialled
+  // node is not there; its pending dial ends as a failed one)
+  if (new_conn->IsActive() && remote_node != new_conn->RemoteNode()) {
+    const NodeId dialled = new_conn->RemoteNode();
+    LOG(DEBUG) << "Dial to " << IdToBase58(dialled) << " answered by " << IdToBase58(remote_node) << ": dropped";
+    new_conn->Abandon();
+    AddToUnreachable(dialled);
+    ClearSendQueue(dialled);
+    RemoveFromPendingConn(dialled);
+    return;
+  }
+
   connections_.insert(std::make_pair(remote_node, new_conn));
 
   if (!new_conn->IsActive()) {
@@ -407,7 +429,7 @@ void Host::OnConnected(Packet&& conn_pack, Connection::Ptr new_conn) {
     LOG(DEBUG) << "New passive connection with " << IdToBase58(remote_node);
   } else {
     LOG(DEBUG) << "New active connection with " << IdToBase58(remote_node);
-    RemoveFromPendingConn(remote_node);
+    RemoveFromPendingConn(new_conn->RemoteNode());
   }
 
   CheckSendQueue(remote_node, new_conn);

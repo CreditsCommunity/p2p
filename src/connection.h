@@ -47,6 +47,10 @@ class Connection : public std::enable_shared_from_this<Connection> {
 
   bool IsActive() const noexcept { return active_; }
   bool IsConnected() const;
+  // dropped or abandoned: it sends nothing more and its owner must not take it
+  bool IsDropped() const noexcept { return dropped_; }
+  // the node this connection was dialled to (active), or the registered sender (passive)
+  const NodeId& RemoteNode() const noexcept { return remote_node_; }
 
   Endpoint GetEndpoint() const { return socket_.remote_endpoint(); }
 
@@ -61,6 +65,7 @@ class Connection : public std::enable_shared_from_this<Connection> {
   Connection(ConnectionOwner&, ba::io_context&, bi::tcp::socket&&);
 
   void StartWrite();
+  void ClearSendQueue();
   void ReadData();
   void OnPacketRead();
   bool CheckRead(const boost::system::error_code&, size_t expected, size_t len);

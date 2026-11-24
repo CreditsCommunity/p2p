@@ -257,6 +257,10 @@ void Host::Connect(const NodeEntrance& peer) {
   }
 
   auto new_conn = Connection::Create(static_cast<ConnectionOwner&>(*this), io_);
+  {
+    Guard g(pend_conn_mux_);
+    pending_dials_[peer.id] = new_conn;
+  }
   new_conn->Connect(Connection::Endpoint(peer.address, peer.tcp_port),
                     FormPacket(Packet::Type::kRegistration,
                                Network::Instance().GetRegistrationData(),
@@ -305,9 +309,16 @@ void Host::Reset() {
     }
     connections_.clear();
   }
+  std::unordered_map<NodeId, Connection::Ptr> dials;
   {
     Guard g(pend_conn_mux_);
     pending_connections_.clear();
+    dials.swap(pending_dials_);
+  }
+  // the dials in flight end without a word: reported, a dial cut here would mark its peer unreachable
+  // for 120 s, right when the routing table looks it up again
+  for (auto& d : dials) {
+    d.second->Abandon();
   }
   {
     Guard g(send_mux_);
@@ -475,6 +486,7 @@ void Host::OnPendingConnectionError(const NodeId& id, Connection::DropReason dro
 void Host::RemoveFromPendingConn(const NodeId& id) {
   Guard g(pend_conn_mux_);
   pending_connections_.erase(id);
+  pending_dials_.erase(id);
 }
 
 bool Host::HasPendingConnection(const NodeId& id) {

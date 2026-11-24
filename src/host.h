@@ -50,6 +50,10 @@ class Host : public RoutingTableEventHandler, public BanManOwner, public Connect
   // emptied (the handler hears every node removed) and looked up again from the boot nodes and the
   // nodes it held, each of which must answer again to come back, with the endpoint it has now.
   // For a node that keeps missing what the network sends it after a network outage.
+  // Pending dials are abandoned (closed without marking their peers unreachable). The pinger's timers
+  // in flight find their pings forgotten and end, but one that fires after a new ping to the same node
+  // takes it for its own: that node, or the replacer of an old ping, may be evicted or added one ping
+  // early, and then answers or is evicted like any other.
   void Reset();
 
   void Ban(const NodeId&);
@@ -122,6 +126,8 @@ class Host : public RoutingTableEventHandler, public BanManOwner, public Connect
 
   Mutex pend_conn_mux_;
   std::unordered_set<NodeId> pending_connections_;
+  // the connections of those dials (Reset abandons them)
+  std::unordered_map<NodeId, Connection::Ptr> pending_dials_;
 
   Mutex unreachable_mux_;
   constexpr static std::chrono::seconds kMaxSecondsInUnreachablePool_{120};

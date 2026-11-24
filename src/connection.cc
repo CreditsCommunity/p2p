@@ -109,6 +109,11 @@ void Connection::Close() {
   } catch (...) {}
 }
 
+void Connection::Abandon() {
+  dropped_ = true;
+  Close();
+}
+
 void Connection::Drop(DropReason reason) {
   if (dropped_) return;
   dropped_ = true;

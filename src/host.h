@@ -38,6 +38,12 @@ class Host : public RoutingTableEventHandler, public BanManOwner, public Connect
 
   void AddKnownNodes(const std::vector<NodeEntrance>&);
   void GetKnownNodes(std::vector<NodeEntrance>&);
+  // the k-buckets only: nodes whose datagrams came from the endpoint recorded (never the explorer's
+  // list of nodes other nodes named, which full discovery returns from GetKnownNodes)
+  void GetRoutingTableNodes(std::vector<NodeEntrance>&);
+  // a direct message to a node of the k-buckets, at the endpoint recorded; nothing (false) for any
+  // other id: no queue, no lookup
+  bool SendDirectIfKnown(const NodeId& to, ByteVector&& msg);
 
   // What a restart of the process rebuilds, without one: every connection is closed, the pending
   // connections, the send queues and the unreachable peers are forgotten, and the routing table is

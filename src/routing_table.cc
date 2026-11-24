@@ -130,6 +130,15 @@ void RoutingTable::GetKnownNodes(std::vector<NodeEntrance>& result) {
   }
 }
 
+void RoutingTable::GetBucketNodes(std::vector<NodeEntrance>& result) {
+  result.clear();
+  Guard g(k_bucket_mux_);
+  for (size_t i = 0; i < kBucketsNum; ++i) {
+    const auto& nodes = k_buckets_[i].GetNodes();
+    result.insert(result.end(), nodes.begin(), nodes.end());
+  }
+}
+
 std::vector<NodeEntrance> RoutingTable::GetBroadcastList(const NodeId& received_from) {
   std::vector<NodeEntrance> ret;
   int32_t index = KBucketIndex(received_from);

@@ -56,6 +56,8 @@ class RoutingTable : public UdpSocketEventHandler {
   void StartFindNode(const NodeId&);
 
   void GetKnownNodes(std::vector<NodeEntrance>&);
+  // the k-buckets' nodes, whatever full discovery says
+  void GetBucketNodes(std::vector<NodeEntrance>&);
 
   std::vector<NodeEntrance> GetBroadcastList(const NodeId&);
 

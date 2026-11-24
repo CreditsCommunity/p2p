@@ -271,6 +271,22 @@ void Host::GetKnownNodes(std::vector<NodeEntrance>& nodes) {
   routing_table_->GetKnownNodes(nodes);
 }
 
+void Host::GetRoutingTableNodes(std::vector<NodeEntrance>& nodes) {
+  routing_table_->GetBucketNodes(nodes);
+}
+
+bool Host::SendDirectIfKnown(const NodeId& receiver, ByteVector&& data) {
+  if (receiver == my_id_) {
+    return false;
+  }
+  NodeEntrance receiver_contacts;
+  if (!routing_table_->HasNode(receiver, receiver_contacts)) {
+    return false;
+  }
+  SendPacket(receiver_contacts, FormPacket(Packet::Type::kDirect, std::move(data), receiver));
+  return true;
+}
+
 void Host::Reset() {
   auto& config = Network::Instance().GetConfig();
   std::vector<NodeEntrance> nodes = config.use_default_boot_nodes ?

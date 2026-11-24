@@ -150,21 +150,6 @@ std::vector<NodeEntrance> RoutingTable::GetBroadcastList(const NodeId& received_
   return ret;
 }
 
-void RoutingTable::UpdateTcpPort(const NodeId& id, uint16_t port) {
-  auto index = KBucketIndex(id);
-  if (index == kIvalidIndex) return;
-
-  NodeEntrance contacts;
-
-  Guard g(k_bucket_mux_);
-  auto& bucket = k_buckets_[index];
-
-  if (bucket.Get(id, contacts) && port != contacts.tcp_port) {
-    contacts.tcp_port = port;
-    bucket.Update(contacts);
-  }
-}
-
 void RoutingTable::OnPacketReceived(const bi::udp::endpoint& from, const ByteVector& data) {
   if (host_.IsEndpointBanned(from.address(), from.port())) return;
 
@@ -235,7 +220,7 @@ void RoutingTable::UpdateKBuckets(const NodeEntrance& node, bool refresh_user_da
   if (bucket.Get(node.id, existing)) {
     // The entry is refreshed only from its own endpoint (checked again under the lock: the entry
     // may have changed since CheckEndpoint), and only its user data (version, capabilities):
-    // address and ports stay as recorded (the TCP port is UpdateTcpPort's).
+    // address and ports stay as recorded.
     if (refresh_user_data && existing.user_data != node.user_data &&
         existing.address == node.address && existing.udp_port == node.udp_port) {
       existing.user_data = node.user_data;

@@ -262,9 +262,11 @@ void Network::OnConnected(Packet&& conn_pack, Connection::Ptr conn) {
     // or we are on the same private network
     if (reg_data.internal_addr_ == ep.address()) return;
 
-    if (routing_table_ && reg_data.internal_port_ != ep.port()) {
-      routing_table_->UpdateTcpPort(conn_pack.header.sender, ep.port());
-    }
+    // The source port of a connection a peer opened is an ephemeral port of its NAT, not one it can
+    // be reached at: the routing table keeps the TCP port the peer announces. Taking the source port
+    // (RoutingTable::UpdateTcpPort, removed) made the peer unreachable as soon as this connection closed: every
+    // dial failed, the peer was marked unreachable again every 120 s and nothing reached it, round
+    // packages included, until it left the routing table, that is until it was restarted.
 
     if (behind_NAT_) return;
     AddIntermediaryClient(conn_pack.header.sender);

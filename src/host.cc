@@ -305,9 +305,10 @@ void Host::Reset() {
     // that registers meanwhile either is in connections_ already and is closed here, or finds itself
     // abandoned in OnConnected and is never taken
     Guard g(conn_mux_);
-    // their handlers end with an error and report the drop, which finds nothing left to erase
+    // their handlers end with an error and report the drop, which finds nothing left to erase; the
+    // sockets are closed on the io thread, like every other operation on them
     for (auto& c : connections_) {
-      c.second->Close();
+      ba::post(io_, [conn = c.second]() { conn->Close(); });
       ++closed;
     }
     connections_.clear();
@@ -524,7 +525,7 @@ void Host::DropConnections(const NodeId& id) {
   Guard g(conn_mux_);
   auto range = connections_.equal_range(id);
   for (auto it = range.first; it != range.second;) {
-    it->second->Close();
+    ba::post(io_, [conn = it->second]() { conn->Close(); });
     it = connections_.erase(it);
     LOG(DEBUG) << "Manualy drop connection with " << IdToBase58(id);
   }

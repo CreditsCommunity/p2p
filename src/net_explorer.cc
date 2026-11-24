@@ -45,8 +45,10 @@ void RoutingTable::NetExplorer::DiscoveryRoutine(std::future<void>&& stop_condit
 }
 
 void RoutingTable::NetExplorer::Find(const NodeId& id, const std::vector<NodeEntrance>& find_list) {
+  uint64_t generation = 0;
   {
    Guard g(find_node_mux_);
+   generation = find_generation_;
    auto& nodes_to_query = find_node_sent_[id];
    if (nodes_to_query.size() != 0) {
      // Find node procedure has already been started for this node.
@@ -63,10 +65,11 @@ void RoutingTable::NetExplorer::Find(const NodeId& id, const std::vector<NodeEnt
   auto timer = std::make_shared<DeadlineTimer>(
                 routing_table_.io_, boost::posix_time::seconds(kDiscoveryExpirationSeconds.count()));
 
-  auto callback = [this, timer, id](const boost::system::error_code&) {
+  auto callback = [this, timer, id, generation](const boost::system::error_code&) {
                     bool node_found = true;
                     {
                      Guard g(find_node_mux_);
+                     if (generation != find_generation_) return;
                      if (find_node_sent_.erase(id)) {
                        node_found = false;
                      }
@@ -78,6 +81,12 @@ void RoutingTable::NetExplorer::Find(const NodeId& id, const std::vector<NodeEnt
                   };
 
   timer->async_wait(std::move(callback));
+}
+
+void RoutingTable::NetExplorer::Clear() {
+  Guard g(find_node_mux_);
+  find_node_sent_.clear();
+  ++find_generation_;
 }
 
 void RoutingTable::NetExplorer::CheckFindNodeResponce(const KademliaDatagram& d) {

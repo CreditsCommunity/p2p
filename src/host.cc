@@ -271,6 +271,43 @@ void Host::GetKnownNodes(std::vector<NodeEntrance>& nodes) {
   routing_table_->GetKnownNodes(nodes);
 }
 
+void Host::Reset() {
+  auto& config = Network::Instance().GetConfig();
+  std::vector<NodeEntrance> nodes = config.use_default_boot_nodes ?
+                                    GetDefaultBootNodes() : config.custom_boot_nodes;
+  std::vector<NodeEntrance> held;
+  routing_table_->GetKnownNodes(held);
+  nodes.insert(nodes.end(), held.begin(), held.end());
+
+  size_t closed = 0;
+  {
+    Guard g(conn_mux_);
+    // their handlers end with an error and report the drop, which finds nothing left to erase
+    for (auto& c : connections_) {
+      c.second->Close();
+      ++closed;
+    }
+    connections_.clear();
+  }
+  {
+    Guard g(pend_conn_mux_);
+    pending_connections_.clear();
+  }
+  {
+    Guard g(send_mux_);
+    send_queue_.clear();
+    packets_to_send_ = 0;
+  }
+  {
+    Guard g(unreachable_mux_);
+    unreachable_peers_.clear();
+  }
+
+  LOG(INFO) << "Reset: " << closed << " connection(s) closed, routing table of " << held.size()
+            << " node(s) looked up again";
+  routing_table_->Reset(nodes);
+}
+
 void Host::TcpListen() {
   auto& contacts = Network::Instance().GetHostContacts();
 
@@ -351,11 +388,13 @@ void Host::OnConnected(Packet&& conn_pack, Connection::Ptr new_conn) {
 }
 
 void Host::OnConnectionDropped(const NodeId& remote_node, bool active,
-                               Connection::DropReason drop_reason) {
+                               Connection::DropReason drop_reason, const Connection* conn) {
   Guard g(conn_mux_);
   auto range = connections_.equal_range(remote_node);
   for (auto it = range.first; it != range.second;) {
-    if (it->second->IsActive() == active) {
+    // only the connection that dropped: erasing every connection of that direction also took out a
+    // newer one to the same peer, which then stayed open but unused, and the peer looked unconnected
+    if (it->second.get() == conn) {
       it = connections_.erase(it);
       LOG(DEBUG) << "Connection with " << IdToBase58(remote_node)
                 << " was closed, active: " << active << ". Reason: "

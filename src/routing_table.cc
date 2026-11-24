@@ -67,6 +67,35 @@ void RoutingTable::AddNodes(const std::vector<NodeEntrance>& nodes) {
   }
 }
 
+void RoutingTable::Reset(const std::vector<NodeEntrance>& nodes) {
+  std::vector<NodeEntrance> removed;
+  {
+    Guard g(k_bucket_mux_);
+    for (size_t i = 0; i < kBucketsNum; ++i) {
+      const auto& bucket_nodes = k_buckets_[i].GetNodes();
+      removed.insert(removed.end(), bucket_nodes.begin(), bucket_nodes.end());
+      k_buckets_[i].Clear();
+    }
+    total_nodes_ = 0;
+  }
+  pinger_.Clear();
+  explorer_.Clear();
+
+  for (const auto& n : removed) {
+    NotifyHost(n, RoutingTableEventType::kNodeRemoved);
+  }
+
+  // the table is empty: a lookup of our own id from these nodes (AddNodes)
+  std::vector<NodeEntrance> unique;
+  for (const auto& n : nodes) {
+    if (n.id == host_data_.id) continue;
+    if (std::find_if(unique.begin(), unique.end(), [&n](const NodeEntrance& u) { return u.id == n.id; }) == unique.end()) {
+      unique.push_back(n);
+    }
+  }
+  AddNodes(unique);
+}
+
 bool RoutingTable::HasNode(const NodeId& id, NodeEntrance& result) {
   Guard g(k_bucket_mux_);
   return k_buckets_[KBucketIndex(id)].Get(id, result);

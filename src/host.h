@@ -39,6 +39,13 @@ class Host : public RoutingTableEventHandler, public BanManOwner, public Connect
   void AddKnownNodes(const std::vector<NodeEntrance>&);
   void GetKnownNodes(std::vector<NodeEntrance>&);
 
+  // What a restart of the process rebuilds, without one: every connection is closed, the pending
+  // connections, the send queues and the unreachable peers are forgotten, and the routing table is
+  // emptied (the handler hears every node removed) and looked up again from the boot nodes and the
+  // nodes it held, each of which must answer again to come back, with the endpoint it has now.
+  // For a node that keeps missing what the network sends it after a network outage.
+  void Reset();
+
   void Ban(const NodeId&);
   void Unban(const NodeId&);
   void ClearBanList();
@@ -56,7 +63,8 @@ class Host : public RoutingTableEventHandler, public BanManOwner, public Connect
   // ConnectionOwner
   void OnPacketReceived(Packet&&) override;
   void OnConnected(Packet&& conn_pack, Connection::Ptr) override;
-  void OnConnectionDropped(const NodeId& remote_node, bool active, Connection::DropReason) override;
+  void OnConnectionDropped(const NodeId& remote_node, bool active, Connection::DropReason,
+                           const Connection* conn) override;
   void OnPendingConnectionError(const NodeId&, Connection::DropReason) override;
 
  private:

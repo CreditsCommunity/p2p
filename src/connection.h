@@ -85,7 +85,10 @@ class ConnectionOwner {
  public:
   virtual void OnPacketReceived(Packet&&) = 0;
   virtual void OnConnected(Packet&& conn_pack, Connection::Ptr) = 0;
-  virtual void OnConnectionDropped(const NodeId& remote_node, bool active, Connection::DropReason) = 0;
+  // the connection that dropped: only that one leaves the owner's table (a newer connection with the
+  // same peer and direction stays)
+  virtual void OnConnectionDropped(const NodeId& remote_node, bool active, Connection::DropReason,
+                                   const Connection* conn) = 0;
   virtual void OnPendingConnectionError(const NodeId&, Connection::DropReason) = 0;
 };
 

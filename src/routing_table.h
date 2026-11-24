@@ -47,6 +47,11 @@ class RoutingTable : public UdpSocketEventHandler {
   // starts lookup if not started yet
   void AddNodes(const std::vector<NodeEntrance>&);
 
+  // Empties the k-buckets (the host hears every node removed), forgets the pings and lookups in
+  // flight and looks the network up again from `nodes`: a node comes back when it answers, with
+  // the endpoint its datagrams come from.
+  void Reset(const std::vector<NodeEntrance>& nodes);
+
   bool HasNode(const NodeId&, NodeEntrance&);
   void StartFindNode(const NodeId&);
 
@@ -120,6 +125,8 @@ class RoutingTable : public UdpSocketEventHandler {
     void Find(const NodeId&, const std::vector<NodeEntrance>& find_list);
     void CheckFindNodeResponce(const KademliaDatagram&);
     void GetKnownNodes(std::vector<NodeEntrance>&);
+    // forgets the lookups in flight
+    void Clear();
 
    private:
     void DiscoveryRoutine(std::future<void>&&);
@@ -132,6 +139,8 @@ class RoutingTable : public UdpSocketEventHandler {
 
     Mutex find_node_mux_;
     std::unordered_map<NodeId, std::vector<NodeId>> find_node_sent_;
+    // bumped by Clear: the timer of a lookup started before ends nothing started after
+    uint64_t find_generation_ = 0;
 
     static constexpr std::chrono::seconds kUpdateNodesInterval{60 * 10};
     Mutex nodes_mux_;
@@ -158,6 +167,8 @@ class RoutingTable : public UdpSocketEventHandler {
                   std::shared_ptr<NodeEntrance> replacer = nullptr);
     // true when the response answers an outstanding ping of ours
     bool CheckPingResponce(const KademliaDatagram&);
+    // forgets the pings in flight (their timers then find nothing to do)
+    void Clear();
 
    private:
     void PingRoutine(std::future<void>&&);

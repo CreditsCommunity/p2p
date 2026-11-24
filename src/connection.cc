@@ -114,7 +114,7 @@ void Connection::Drop(DropReason reason) {
   dropped_ = true;
 
   if (registation_passed_) {
-    host_.OnConnectionDropped(remote_node_, active_, reason);
+    host_.OnConnectionDropped(remote_node_, active_, reason, this);
   } else if (active_) {
     host_.OnPendingConnectionError(remote_node_, reason);
   } else {

@@ -23,6 +23,8 @@ class KBucket {
 
   NodeEntrance LeastRecentlySeen() const noexcept;
 
+  void Clear() noexcept { nodes_.clear(); }
+
   const auto& GetNodes() const noexcept {
     return nodes_;
   }

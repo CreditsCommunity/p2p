@@ -205,7 +205,7 @@ void RoutingTable::OnEvicted(const NodeEntrance& node) {
   }
   LOG(INFO) << "Rediscovery: " << IdToBase58(node.id) << " stopped answering after "
             << std::chrono::duration_cast<std::chrono::seconds>(tenure).count() << " s in the routing table"
-            << (kept ? ", it will be pinged again" : ", not kept (lost list full)");
+            << (kept ? ", it will be pinged again" : ", not kept (lost list full, or that id kept at another endpoint)");
 }
 
 std::vector<NodeEntrance> RoutingTable::GetBroadcastList(const NodeId& received_from) {
@@ -234,7 +234,19 @@ void RoutingTable::OnPacketReceived(const bi::udp::endpoint& from, const ByteVec
   auto packet = KademliaDatagram::ReinterpretUdpPacket(from, data);
   if (!packet) return;
 
-  if (!CheckEndpoint(*packet)) {
+  // A lost peer answering, from the endpoint recorded when it was lost, the ping PingLostAndBootNodes
+  // sent it there. Verified before the endpoint check: a node that took its id in the k-buckets
+  // meanwhile, at another endpoint, would otherwise keep it out for good; the k-bucket entry takes the
+  // verified endpoint instead.
+  std::optional<std::chrono::steady_clock::time_point> lost_at;
+  if (packet->DatagramType() == PingRespDatagram::type && packet->node_from.id != host_data_.id) {
+    Guard g(lost_mux_);
+    lost_at = lost_.Answered(packet->node_from, std::chrono::steady_clock::now(), kPingExpirationSeconds);
+  }
+
+  if (lost_at) {
+    TakeVerifiedEndpoint(packet->node_from);
+  } else if (!CheckEndpoint(*packet)) {
     LOG(DEBUG) << "Endpoint check failed from " << from.address() << ", " << from.port();
     return;
   }
@@ -243,20 +255,15 @@ void RoutingTable::OnPacketReceived(const bi::udp::endpoint& from, const ByteVec
   // ours: an unsolicited datagram with a forged source address cannot change it
   bool answered = false;
   bool refresh_user_data = false;
-  // a lost peer answering, from its recorded endpoint, the ping PingLostAndBootNodes sent it
-  std::optional<std::chrono::steady_clock::time_point> lost_at;
 
   switch (packet->DatagramType()) {
     case PingDatagram::type :
       HandlePing(*packet);
       break;
-    case PingRespDatagram::type : {
+    case PingRespDatagram::type :
       answered = pinger_.CheckPingResponce(*packet);
       refresh_user_data = answered && packet->has_user_data;
-      Guard g(lost_mux_);
-      lost_at = lost_.Answered(packet->node_from, std::chrono::steady_clock::now(), kPingExpirationSeconds);
       break;
-    }
     case FindNodeDatagram::type :
       HandleFindNode(*packet);
       break;
@@ -272,6 +279,19 @@ void RoutingTable::OnPacketReceived(const bi::udp::endpoint& from, const ByteVec
   if (lost_at) {
     OnLostPeerBack(packet->node_from, *lost_at);
   }
+}
+
+void RoutingTable::TakeVerifiedEndpoint(const NodeEntrance& node) {
+  Guard g(k_bucket_mux_);
+  auto index = KBucketIndex(node.id);
+  if (index == kIvalidIndex) return;
+  NodeEntrance squatter;
+  if (!k_buckets_[index].Get(node.id, squatter) || !k_buckets_[index].ReplaceEndpoint(node)) return;
+  // whatever answered at the other endpoint was not this node: its answers do not count for it
+  answering_since_.erase(node.id);
+  LOG(WARNING) << "Rediscovery: " << IdToBase58(node.id) << " answered at its recorded endpoint " << node.address
+               << ":" << node.udp_port << "; the routing table held that id at " << squatter.address << ":"
+               << squatter.udp_port << ", replaced";
 }
 
 bool RoutingTable::CheckEndpoint(const KademliaDatagram& d) {

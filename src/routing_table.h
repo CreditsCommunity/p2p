@@ -122,6 +122,10 @@ class RoutingTable : public UdpSocketEventHandler {
   // node listed by another one (FindNode replies) is never written here.
   void UpdateKBuckets(const NodeEntrance& sender, bool answered, bool refresh_user_data);
 
+  // A lost peer answered our ping from its recorded endpoint: if the k-buckets hold its id at another
+  // endpoint (taken meanwhile by whoever claimed that id), the entry takes the verified one.
+  void TakeVerifiedEndpoint(const NodeEntrance&);
+
   // a lost peer answered our ping from its recorded endpoint and left the lost list: logged, and a
   // lookup through it so that its side learns of us and we of its side
   void OnLostPeerBack(const NodeEntrance&, std::chrono::steady_clock::time_point lost_at);

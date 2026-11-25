@@ -41,10 +41,16 @@ class LostPeers {
   static constexpr std::chrono::seconds kMaxRetry{180};
   static constexpr std::chrono::hours kForgetAfter{24};
 
-  // `tenure`: how long the peer had been answering in the k-buckets. False if it was not kept (the
-  // list is full of peers with a tenure at least as long).
+  // `tenure`: how long the peer had been answering in the k-buckets. False if it was not kept: the
+  // list is full of peers with a tenure at least as long, or it already holds that id at another
+  // endpoint. The first endpoint recorded for an id stays, with its own tenure: a node that took the
+  // id meanwhile at another endpoint (anyone can claim any id) and was evicted in turn neither
+  // replaces it nor inherits its tenure. A peer that really moved comes back by its own pings.
   bool Add(const NodeEntrance& node, Clock::duration tenure, Clock::time_point now) {
     auto it = Find(node.id);
+    if (it != peers_.end() && (it->node.address != node.address || it->node.udp_port != node.udp_port)) {
+      return false;
+    }
     if (it != peers_.end()) {
       it->node = node;
       it->tenure = std::max(it->tenure, tenure);

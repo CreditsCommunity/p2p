@@ -1,6 +1,7 @@
 #include "routing_table.h"
 
 #include <algorithm>
+#include <random>
 #include <thread>
 
 #include "network.h"
@@ -20,6 +21,8 @@ RoutingTable::RoutingTable(ba::io_context& io,
       k_buckets_(new KBucket[kBucketsNum]),
       pinger_(*this),
       explorer_(*this, Network::Instance().GetConfig().full_net_discovery) {
+  // Host::Run has just looked the boot nodes up
+  next_boot_recheck_ = std::chrono::steady_clock::now() + kBootRecheckInterval;
   socket_->Open();
 
   pinger_.Start(pinger_stopper_.get_future());
@@ -77,6 +80,8 @@ void RoutingTable::Reset(const std::vector<NodeEntrance>& nodes) {
       k_buckets_[i].Clear();
     }
     total_nodes_ = 0;
+    // the lost peers stay: they are not in `nodes` and still to be pinged again
+    answering_since_.clear();
   }
   pinger_.Clear();
   explorer_.Clear();
@@ -139,6 +144,79 @@ void RoutingTable::GetBucketNodes(std::vector<NodeEntrance>& result) {
   }
 }
 
+void RoutingTable::GetLostNodes(std::vector<NodeEntrance>& result) {
+  result.clear();
+  Guard g(lost_mux_);
+  lost_.Get(result);
+}
+
+void RoutingTable::PingLostAndBootNodes() {
+  using namespace std::chrono;
+  const auto now = steady_clock::now();
+
+  std::vector<NodeEntrance> targets;
+  {
+    Guard g(lost_mux_);
+    targets = lost_.Due(now);
+  }
+  const size_t lost_count = targets.size();
+
+  if (now >= next_boot_recheck_) {
+    next_boot_recheck_ = now + kBootRecheckInterval;
+    auto& config = Network::Instance().GetConfig();
+    const auto boot_nodes = config.use_default_boot_nodes ? GetDefaultBootNodes() : config.custom_boot_nodes;
+    for (size_t i = 0; i < boot_nodes.size() && i < kMaxBootRecheck; ++i) {
+      targets.push_back(boot_nodes[i]);
+    }
+  }
+
+  std::vector<NodeId> back;
+  size_t sent = 0;
+  for (size_t i = 0; i < targets.size(); ++i) {
+    const auto& n = targets[i];
+    if (n.id == host_data_.id) continue;
+    {
+      Guard g(k_bucket_mux_);
+      auto index = KBucketIndex(n.id);
+      if (index != kIvalidIndex && k_buckets_[index].Exists(n.id)) {
+        // back in the k-buckets by another way
+        if (i < lost_count) back.push_back(n.id);
+        continue;
+      }
+    }
+    if (host_.IsEndpointBanned(n.address, n.udp_port)) continue;
+
+    PingDatagram ping(host_data_);
+    socket_->Send(ping.ToUdp(n));
+    ++sent;
+  }
+
+  if (!back.empty()) {
+    Guard g(lost_mux_);
+    for (const auto& id : back) lost_.Remove(id);
+  }
+  if (sent) {
+    LOG(DEBUG) << "Rediscovery: pinged " << sent << " lost peer(s) or boot node(s) missing from the routing table";
+  }
+}
+
+void RoutingTable::OnEvicted(const NodeEntrance& node) {
+  auto it = answering_since_.find(node.id);
+  if (it == answering_since_.end()) return;  // never answered a ping of ours
+  const auto now = std::chrono::steady_clock::now();
+  const auto tenure = now - it->second;
+  answering_since_.erase(it);
+
+  bool kept = false;
+  {
+    Guard g(lost_mux_);
+    kept = lost_.Add(node, tenure, now);
+  }
+  LOG(INFO) << "Rediscovery: " << IdToBase58(node.id) << " stopped answering after "
+            << std::chrono::duration_cast<std::chrono::seconds>(tenure).count() << " s in the routing table"
+            << (kept ? ", it will be pinged again" : ", not kept (lost list full)");
+}
+
 std::vector<NodeEntrance> RoutingTable::GetBroadcastList(const NodeId& received_from) {
   std::vector<NodeEntrance> ret;
   int32_t index = KBucketIndex(received_from);
@@ -172,6 +250,7 @@ void RoutingTable::OnPacketReceived(const bi::udp::endpoint& from, const ByteVec
 
   // a node's user data (version, capabilities) is refreshed only from the answer to a ping of
   // ours: an unsolicited datagram with a forged source address cannot change it
+  bool answered = false;
   bool refresh_user_data = false;
 
   switch (packet->DatagramType()) {
@@ -179,7 +258,8 @@ void RoutingTable::OnPacketReceived(const bi::udp::endpoint& from, const ByteVec
       HandlePing(*packet);
       break;
     case PingRespDatagram::type :
-      refresh_user_data = pinger_.CheckPingResponce(*packet) && packet->has_user_data;
+      answered = pinger_.CheckPingResponce(*packet);
+      refresh_user_data = answered && packet->has_user_data;
       break;
     case FindNodeDatagram::type :
       HandleFindNode(*packet);
@@ -191,7 +271,7 @@ void RoutingTable::OnPacketReceived(const bi::udp::endpoint& from, const ByteVec
       break;
   }
 
-  UpdateKBuckets(packet->node_from, refresh_user_data);
+  UpdateKBuckets(packet->node_from, answered, refresh_user_data);
 }
 
 bool RoutingTable::CheckEndpoint(const KademliaDatagram& d) {
@@ -220,29 +300,63 @@ void RoutingTable::HandleFindNode(const KademliaDatagram& d) {
   socket_->Send(answer.ToUdp(d.node_from));
 }
 
-void RoutingTable::UpdateKBuckets(const NodeEntrance& node, bool refresh_user_data) {
+void RoutingTable::UpdateKBuckets(const NodeEntrance& node, bool answered, bool refresh_user_data) {
   if (node.id == host_data_.id) return;
 
-  Guard g(k_bucket_mux_);
-  KBucket& bucket = k_buckets_[KBucketIndex(node.id)];
-  NodeEntrance existing;
-  if (bucket.Get(node.id, existing)) {
-    // The entry is refreshed only from its own endpoint (checked again under the lock: the entry
-    // may have changed since CheckEndpoint), and only its user data (version, capabilities):
-    // address and ports stay as recorded.
-    if (refresh_user_data && existing.user_data != node.user_data &&
-        existing.address == node.address && existing.udp_port == node.udp_port) {
-      existing.user_data = node.user_data;
-      bucket.Update(existing);
+  std::optional<std::chrono::steady_clock::time_point> lost_at;
+  {
+    Guard g(k_bucket_mux_);
+    KBucket& bucket = k_buckets_[KBucketIndex(node.id)];
+    NodeEntrance existing;
+    if (bucket.Get(node.id, existing)) {
+      const bool same_endpoint = existing.address == node.address && existing.udp_port == node.udp_port;
+      // The entry is refreshed only from its own endpoint (checked again under the lock: the entry
+      // may have changed since CheckEndpoint), and only its user data (version, capabilities):
+      // address and ports stay as recorded.
+      if (refresh_user_data && existing.user_data != node.user_data && same_endpoint) {
+        existing.user_data = node.user_data;
+        bucket.Update(existing);
+      }
+      if (answered && same_endpoint) {
+        answering_since_.emplace(node.id, std::chrono::steady_clock::now());
+      }
+      bucket.Promote(node.id);
+    } else if (bucket.Size() < k) {
+      bucket.AddNode(node);
+      ++total_nodes_;
+      if (answered) {
+        answering_since_.emplace(node.id, std::chrono::steady_clock::now());
+      }
+      NotifyHost(node, RoutingTableEventType::kNodeAdded);
+      Guard l(lost_mux_);
+      lost_at = lost_.Remove(node.id);
+    } else {
+      pinger_.SendPing(bucket.LeastRecentlySeen(), bucket, std::make_shared<NodeEntrance>(node));
     }
-    bucket.Promote(node.id);
-  } else if (bucket.Size() < k) {
-    bucket.AddNode(node);
-    ++total_nodes_;
-    NotifyHost(node, RoutingTableEventType::kNodeAdded);
-  } else {
-    pinger_.SendPing(bucket.LeastRecentlySeen(), bucket, std::make_shared<NodeEntrance>(node));
   }
+
+  if (lost_at) {
+    const auto now = std::chrono::steady_clock::now();
+    LOG(INFO) << "Rediscovery: " << IdToBase58(node.id) << " is back in the routing table "
+              << std::chrono::duration_cast<std::chrono::seconds>(now - *lost_at).count()
+              << " s after it stopped answering";
+    // A lookup of a random id through it, as the explorer makes every minute through the nearest
+    // nodes: every node the lookup reaches hears from us and adds us, and those that answer come back
+    // here. At most one every kRediscoveryLookupInterval, however many lost peers come back at once.
+    auto last = last_rediscovery_lookup_.load();
+    if (now - last >= kRediscoveryLookupInterval && last_rediscovery_lookup_.compare_exchange_strong(last, now)) {
+      explorer_.Find(RandomId(), {node});
+    }
+  }
+}
+
+NodeId RoutingTable::RandomId() {
+  thread_local std::mt19937 gen(std::random_device{}());
+  std::uniform_int_distribution<uint32_t> dist;
+  NodeId id;
+  uint32_t* ptr = id.GetPtr();
+  std::generate(ptr, ptr + id.size() / sizeof(uint32_t), [&]() -> uint32_t { return dist(gen); });
+  return id;
 }
 
 std::vector<NodeEntrance> RoutingTable::NearestNodes(const NodeId& target) {

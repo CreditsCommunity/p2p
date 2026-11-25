@@ -279,6 +279,10 @@ void Host::GetRoutingTableNodes(std::vector<NodeEntrance>& nodes) {
   routing_table_->GetBucketNodes(nodes);
 }
 
+void Host::GetLostNodes(std::vector<NodeEntrance>& nodes) {
+  routing_table_->GetLostNodes(nodes);
+}
+
 bool Host::SendDirectIfKnown(const NodeId& receiver, ByteVector&& data) {
   if (receiver == my_id_) {
     return false;

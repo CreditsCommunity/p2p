@@ -76,6 +76,7 @@ add_library(${PROJECT_NAME} STATIC
   src/k_bucket.h
   src/kademlia_datagram.h
   src/kademlia_datagram.cc
+  src/lost_peers.h
   src/net_explorer.cc
   src/network.h
   src/network.cc

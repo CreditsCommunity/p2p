@@ -15,6 +15,7 @@
 #include "common.h"
 #include "k_bucket.h"
 #include "kademlia_datagram.h"
+#include "lost_peers.h"
 #include "udp.h"
 
 namespace net {
@@ -61,6 +62,17 @@ class RoutingTable : public UdpSocketEventHandler {
 
   std::vector<NodeEntrance> GetBroadcastList(const NodeId&);
 
+  // the peers lost because they stopped answering, still to be pinged again (see LostPeers)
+  void GetLostNodes(std::vector<NodeEntrance>&);
+
+  // Called by the pinger thread on each of its rounds: pings the lost peers whose turn it is (one
+  // datagram each, no eviction or retry of its own), and every kBootRecheckInterval the configured
+  // boot nodes that are not in the k-buckets. A node that answers comes back like any node that sends
+  // a datagram, and the node pinged adds us as well. So two parts of the network cut off from each
+  // other for longer than the pinger waits find each other again when the cut ends, whichever side's
+  // boot nodes they list.
+  void PingLostAndBootNodes();
+
   static NodeId Distance(const NodeId&, const NodeId&);
   static uint16_t KBucketIndex(const NodeId& target, const NodeId& id);
 
@@ -90,6 +102,12 @@ class RoutingTable : public UdpSocketEventHandler {
   static constexpr std::chrono::seconds kDiscoveryInterval{60};
   static constexpr std::chrono::seconds kDiscoveryExpirationSeconds{30};
 
+  // how often the boot nodes missing from the k-buckets are pinged again, and how many at most
+  static constexpr std::chrono::seconds kBootRecheckInterval{600};
+  static constexpr size_t kMaxBootRecheck = 64;
+  // the lookups a lost peer that comes back starts: at most one in this interval
+  static constexpr std::chrono::seconds kRediscoveryLookupInterval{10};
+
   bool CheckEndpoint(const KademliaDatagram&);
 
   void HandlePing(const KademliaDatagram&);
@@ -98,10 +116,17 @@ class RoutingTable : public UdpSocketEventHandler {
   uint16_t KBucketIndex(const NodeId& id) const noexcept;
 
   // Adds the sender of a direct datagram, whose endpoint CheckEndpoint matched, or promotes it.
-  // refresh_user_data: the datagram answers a ping of ours (and carried user data), so the
-  // sender's entry takes its user data. Only for that sender: a node listed by another one
-  // (FindNode replies) is never written here.
-  void UpdateKBuckets(const NodeEntrance& sender, bool refresh_user_data);
+  // answered: the datagram answers a ping of ours; refresh_user_data: it did and carried user data,
+  // so the sender's entry takes its user data. Only for that sender: a node listed by another one
+  // (FindNode replies) is never written here. A lost peer that comes back leaves the lost list, and
+  // our own id is looked up through it (its side learns of us, we of its side).
+  void UpdateKBuckets(const NodeEntrance& sender, bool answered, bool refresh_user_data);
+
+  // the pinger evicted this node of the k-buckets (k_bucket_mux_ held): kept as a lost peer if it
+  // had answered a ping of ours
+  void OnEvicted(const NodeEntrance&);
+
+  static NodeId RandomId();
 
   void OnNodeFound(const NodeEntrance&);
   void OnNodeNotFound(const NodeId&);
@@ -190,6 +215,17 @@ class RoutingTable : public UdpSocketEventHandler {
   Mutex k_bucket_mux_;
   KBucket* k_buckets_;
   std::atomic<size_t> total_nodes_{0};
+
+  // since when each k-bucket node has been answering our pings (its first answer while in the
+  // k-buckets); guarded by k_bucket_mux_
+  std::unordered_map<NodeId, std::chrono::steady_clock::time_point> answering_since_;
+
+  // after k_bucket_mux_ when both are held, never the other way round
+  Mutex lost_mux_;
+  LostPeers lost_;
+  // the pinger thread's only
+  std::chrono::steady_clock::time_point next_boot_recheck_;
+  std::atomic<std::chrono::steady_clock::time_point> last_rediscovery_lookup_{};
 
   Pinger pinger_;
   NetExplorer explorer_;

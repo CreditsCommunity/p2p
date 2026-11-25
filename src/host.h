@@ -44,6 +44,9 @@ class Host : public RoutingTableEventHandler, public BanManOwner, public Connect
   // a direct message to a node of the k-buckets, at the endpoint recorded; nothing (false) for any
   // other id: no queue, no lookup
   bool SendDirectIfKnown(const NodeId& to, ByteVector&& msg);
+  // the peers the routing table lost because they stopped answering and still pings again (at most
+  // 64, each for 24 h at most): with the k-bucket nodes, what to dial again after a restart
+  void GetLostNodes(std::vector<NodeEntrance>&);
 
   // What a restart of the process rebuilds, without one: every connection is closed, the pending
   // connections, the send queues and the unreachable peers are forgotten, and the routing table is

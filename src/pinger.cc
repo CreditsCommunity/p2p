@@ -34,6 +34,8 @@ void RoutingTable::Pinger::PingRoutine(std::future<void>&& stop_condition) {
       routing_table_.AddNodes(boot_nodes);
     }
 
+    routing_table_.PingLostAndBootNodes();
+
     Guard g(routing_table_.k_bucket_mux_);
     for (; current_bucket < routing_table_.kBucketsNum; ++current_bucket) {
       if (routing_table_.k_buckets_[current_bucket].Size()) break;
@@ -85,9 +87,11 @@ void RoutingTable::Pinger::SendPing(const NodeEntrance& target, KBucket& bucket,
                         resendPing = false;
                         ping_sent_.erase(it);
 
-                        if (bucket.Exists(target.id)) {
+                        NodeEntrance evicted;
+                        if (bucket.Get(target.id, evicted)) {
                           bucket.Evict(target.id);
                           routing_table_.total_nodes_--;
+                          routing_table_.OnEvicted(evicted);
                           routing_table_.NotifyHost(target, RoutingTableEventType::kNodeRemoved);
                         }
 

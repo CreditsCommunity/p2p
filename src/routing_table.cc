@@ -154,36 +154,31 @@ void RoutingTable::PingLostAndBootNodes() {
   using namespace std::chrono;
   const auto now = steady_clock::now();
 
+  // the lost peers at their recorded endpoint, even when their id is in the k-buckets again: an entry
+  // leaves the list only when that endpoint answers (LostPeers::Answered, in OnPacketReceived)
   std::vector<NodeEntrance> targets;
   {
     Guard g(lost_mux_);
     targets = lost_.Due(now);
   }
-  const size_t lost_count = targets.size();
 
   if (now >= next_boot_recheck_) {
     next_boot_recheck_ = now + kBootRecheckInterval;
     auto& config = Network::Instance().GetConfig();
     const auto boot_nodes = config.use_default_boot_nodes ? GetDefaultBootNodes() : config.custom_boot_nodes;
     for (size_t i = 0; i < boot_nodes.size() && i < kMaxBootRecheck; ++i) {
-      targets.push_back(boot_nodes[i]);
+      const auto& n = boot_nodes[i];
+      if (n.id == host_data_.id) continue;
+      Guard g(k_bucket_mux_);
+      auto index = KBucketIndex(n.id);
+      if (index != kIvalidIndex && k_buckets_[index].Exists(n.id)) continue;
+      targets.push_back(n);
     }
   }
 
-  std::vector<NodeId> back;
   size_t sent = 0;
-  for (size_t i = 0; i < targets.size(); ++i) {
-    const auto& n = targets[i];
+  for (const auto& n : targets) {
     if (n.id == host_data_.id) continue;
-    {
-      Guard g(k_bucket_mux_);
-      auto index = KBucketIndex(n.id);
-      if (index != kIvalidIndex && k_buckets_[index].Exists(n.id)) {
-        // back in the k-buckets by another way
-        if (i < lost_count) back.push_back(n.id);
-        continue;
-      }
-    }
     if (host_.IsEndpointBanned(n.address, n.udp_port)) continue;
 
     PingDatagram ping(host_data_);
@@ -191,10 +186,6 @@ void RoutingTable::PingLostAndBootNodes() {
     ++sent;
   }
 
-  if (!back.empty()) {
-    Guard g(lost_mux_);
-    for (const auto& id : back) lost_.Remove(id);
-  }
   if (sent) {
     LOG(DEBUG) << "Rediscovery: pinged " << sent << " lost peer(s) or boot node(s) missing from the routing table";
   }
@@ -252,15 +243,20 @@ void RoutingTable::OnPacketReceived(const bi::udp::endpoint& from, const ByteVec
   // ours: an unsolicited datagram with a forged source address cannot change it
   bool answered = false;
   bool refresh_user_data = false;
+  // a lost peer answering, from its recorded endpoint, the ping PingLostAndBootNodes sent it
+  std::optional<std::chrono::steady_clock::time_point> lost_at;
 
   switch (packet->DatagramType()) {
     case PingDatagram::type :
       HandlePing(*packet);
       break;
-    case PingRespDatagram::type :
+    case PingRespDatagram::type : {
       answered = pinger_.CheckPingResponce(*packet);
       refresh_user_data = answered && packet->has_user_data;
+      Guard g(lost_mux_);
+      lost_at = lost_.Answered(packet->node_from, std::chrono::steady_clock::now(), kPingExpirationSeconds);
       break;
+    }
     case FindNodeDatagram::type :
       HandleFindNode(*packet);
       break;
@@ -272,6 +268,10 @@ void RoutingTable::OnPacketReceived(const bi::udp::endpoint& from, const ByteVec
   }
 
   UpdateKBuckets(packet->node_from, answered, refresh_user_data);
+
+  if (lost_at) {
+    OnLostPeerBack(packet->node_from, *lost_at);
+  }
 }
 
 bool RoutingTable::CheckEndpoint(const KademliaDatagram& d) {
@@ -303,7 +303,6 @@ void RoutingTable::HandleFindNode(const KademliaDatagram& d) {
 void RoutingTable::UpdateKBuckets(const NodeEntrance& node, bool answered, bool refresh_user_data) {
   if (node.id == host_data_.id) return;
 
-  std::optional<std::chrono::steady_clock::time_point> lost_at;
   {
     Guard g(k_bucket_mux_);
     KBucket& bucket = k_buckets_[KBucketIndex(node.id)];
@@ -328,25 +327,23 @@ void RoutingTable::UpdateKBuckets(const NodeEntrance& node, bool answered, bool 
         answering_since_.emplace(node.id, std::chrono::steady_clock::now());
       }
       NotifyHost(node, RoutingTableEventType::kNodeAdded);
-      Guard l(lost_mux_);
-      lost_at = lost_.Remove(node.id);
     } else {
       pinger_.SendPing(bucket.LeastRecentlySeen(), bucket, std::make_shared<NodeEntrance>(node));
     }
   }
+}
 
-  if (lost_at) {
-    const auto now = std::chrono::steady_clock::now();
-    LOG(INFO) << "Rediscovery: " << IdToBase58(node.id) << " is back in the routing table "
-              << std::chrono::duration_cast<std::chrono::seconds>(now - *lost_at).count()
-              << " s after it stopped answering";
-    // A lookup of a random id through it, as the explorer makes every minute through the nearest
-    // nodes: every node the lookup reaches hears from us and adds us, and those that answer come back
-    // here. At most one every kRediscoveryLookupInterval, however many lost peers come back at once.
-    auto last = last_rediscovery_lookup_.load();
-    if (now - last >= kRediscoveryLookupInterval && last_rediscovery_lookup_.compare_exchange_strong(last, now)) {
-      explorer_.Find(RandomId(), {node});
-    }
+void RoutingTable::OnLostPeerBack(const NodeEntrance& node, std::chrono::steady_clock::time_point lost_at) {
+  const auto now = std::chrono::steady_clock::now();
+  LOG(INFO) << "Rediscovery: " << IdToBase58(node.id) << " answers again at its endpoint "
+            << std::chrono::duration_cast<std::chrono::seconds>(now - lost_at).count()
+            << " s after it stopped answering";
+  // A lookup of a random id through it, as the explorer makes every minute through the nearest
+  // nodes: every node the lookup reaches hears from us and adds us, and those that answer come back
+  // here. At most one every kRediscoveryLookupInterval, however many lost peers come back at once.
+  auto last = last_rediscovery_lookup_.load();
+  if (now - last >= kRediscoveryLookupInterval && last_rediscovery_lookup_.compare_exchange_strong(last, now)) {
+    explorer_.Find(RandomId(), {node});
   }
 }
 

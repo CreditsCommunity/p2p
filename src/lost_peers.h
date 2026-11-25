@@ -16,13 +16,20 @@ namespace net {
 // network cut every node of the other side is evicted that way, and nothing sends it a datagram again:
 // the k-buckets keep only the reachable side, the lookups ask only that side, and the boot nodes are
 // looked up again only when the table is empty. The two sides then never find each other when the
-// connection comes back. A lost peer is pinged again (one datagram) with a backoff, and comes back into
-// the k-buckets when it answers, as any node that sends a datagram; it adds us back on our ping too.
+// connection comes back. A lost peer is pinged again (one datagram) at the endpoint recorded here, with
+// a backoff; its answer brings it back into the k-buckets like any datagram, and our ping makes it add
+// us back too.
 //
-// Only a peer that answered at least one ping of ours while in the k-buckets is kept (its endpoint
-// was real), at most kMaxPeers of them; when the list is full, the one that had been answering for
-// the shortest time leaves first, so ids that come and go quickly cannot push out the peers of a long
-// cut. A peer is forgotten kForgetAfter after it was lost. Not thread-safe: the routing table guards it.
+// A peer leaves the list only when it answers one of these pings: a ping response from the recorded
+// endpoint (address and UDP port) within the response window of the latest ping to it (Answered). A
+// datagram that only claims its id from another endpoint (a node may name itself anything), or the id
+// showing up in the k-buckets, changes nothing: the entry stays and its endpoint is still pinged.
+//
+// Only a peer whose answer to a ping of ours was verified the same way while it was in the k-buckets
+// is kept (see PingRegistry), at most kMaxPeers of them; when the list is full, the one that had been
+// answering for the shortest time leaves first, so ids that come and go quickly cannot push out the
+// peers of a long cut. A peer is forgotten kForgetAfter after it was lost. Not thread-safe: the
+// routing table guards it.
 class LostPeers {
  public:
   using Clock = std::chrono::steady_clock;
@@ -44,6 +51,7 @@ class LostPeers {
       it->lost = now;
       it->next = now + kFirstRetry;
       it->attempts = 0;
+      it->pinged.reset();
       return true;
     }
     if (peers_.size() >= kMaxPeers) {
@@ -54,14 +62,20 @@ class LostPeers {
       }
       peers_.erase(shortest);
     }
-    peers_.push_back(Entry{node, tenure, now, now + kFirstRetry, 0});
+    peers_.push_back(Entry{node, tenure, now, now + kFirstRetry, 0, std::nullopt});
     return true;
   }
 
-  // when it was lost, if it was in the list
-  std::optional<Clock::time_point> Remove(const NodeId& id) {
-    auto it = Find(id);
-    if (it == peers_.end()) {
+  // `from` (an id and the endpoint its ping response came from) answers the latest ping Due gave for
+  // that id: the recorded address and UDP port, within `window` of that ping. The peer then leaves the
+  // list and the result is when it was lost; otherwise nothing changes.
+  std::optional<Clock::time_point> Answered(const NodeEntrance& from, Clock::time_point now, Clock::duration window) {
+    auto it = Find(from.id);
+    if (it == peers_.end() || !it->pinged) {
+      return std::nullopt;
+    }
+    if (it->node.address != from.address || it->node.udp_port != from.udp_port ||
+        now < *it->pinged || now - *it->pinged > window) {
       return std::nullopt;
     }
     auto lost = it->lost;
@@ -75,9 +89,10 @@ class LostPeers {
 
   size_t Size() const noexcept { return peers_.size(); }
 
-  // The peers to ping now, at most kMaxPerCall, the longest waiting first. Each one's next ping moves
-  // out: kFirstRetry after it was lost, then twice the previous wait each time up to kMaxRetry. The
-  // peers lost kForgetAfter ago or longer are forgotten.
+  // The peers to ping now, at their recorded endpoint whatever the k-buckets hold for their ids: at
+  // most kMaxPerCall, the longest waiting first; the time of each ping is recorded (Answered). Each
+  // one's next ping moves out: kFirstRetry after it was lost, then twice the previous wait each time
+  // up to kMaxRetry. The peers lost kForgetAfter ago or longer are forgotten.
   std::vector<NodeEntrance> Due(Clock::time_point now) {
     peers_.erase(std::remove_if(peers_.begin(), peers_.end(),
                                 [now](const Entry& e) { return now - e.lost >= kForgetAfter; }),
@@ -99,6 +114,7 @@ class LostPeers {
     for (auto* e : due) {
       ++e->attempts;
       e->next = now + Wait(e->attempts);
+      e->pinged = now;
       result.push_back(e->node);
     }
     return result;
@@ -126,6 +142,8 @@ class LostPeers {
     Clock::time_point lost;
     Clock::time_point next;
     uint32_t attempts;
+    // the latest ping Due gave for it
+    std::optional<Clock::time_point> pinged;
   };
 
   std::vector<Entry>::iterator Find(const NodeId& id) {

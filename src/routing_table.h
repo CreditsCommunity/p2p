@@ -16,6 +16,7 @@
 #include "k_bucket.h"
 #include "kademlia_datagram.h"
 #include "lost_peers.h"
+#include "ping_registry.h"
 #include "udp.h"
 
 namespace net {
@@ -116,11 +117,14 @@ class RoutingTable : public UdpSocketEventHandler {
   uint16_t KBucketIndex(const NodeId& id) const noexcept;
 
   // Adds the sender of a direct datagram, whose endpoint CheckEndpoint matched, or promotes it.
-  // answered: the datagram answers a ping of ours; refresh_user_data: it did and carried user data,
-  // so the sender's entry takes its user data. Only for that sender: a node listed by another one
-  // (FindNode replies) is never written here. A lost peer that comes back leaves the lost list, and
-  // our own id is looked up through it (its side learns of us, we of its side).
+  // answered: the datagram answers a ping of ours (verified, see PingRegistry); refresh_user_data:
+  // it did and carried user data, so the sender's entry takes its user data. Only for that sender: a
+  // node listed by another one (FindNode replies) is never written here.
   void UpdateKBuckets(const NodeEntrance& sender, bool answered, bool refresh_user_data);
+
+  // a lost peer answered our ping from its recorded endpoint and left the lost list: logged, and a
+  // lookup through it so that its side learns of us and we of its side
+  void OnLostPeerBack(const NodeEntrance&, std::chrono::steady_clock::time_point lost_at);
 
   // the pinger evicted this node of the k-buckets (k_bucket_mux_ held): kept as a lost peer if it
   // had answered a ping of ours
@@ -190,7 +194,8 @@ class RoutingTable : public UdpSocketEventHandler {
     void Join();
     void SendPing(const NodeEntrance& target, KBucket& bucket,
                   std::shared_ptr<NodeEntrance> replacer = nullptr);
-    // true when the response answers an outstanding ping of ours
+    // true when the response answers an outstanding ping of ours: from the endpoint that ping went
+    // to, within kPingExpirationSeconds of it (see PingRegistry)
     bool CheckPingResponce(const KademliaDatagram&);
     // forgets the pings in flight (their timers then find nothing to do)
     void Clear();
@@ -202,7 +207,7 @@ class RoutingTable : public UdpSocketEventHandler {
     std::thread ping_thread_;
 
     Mutex ping_mux_;
-    std::unordered_map<NodeId, uint8_t> ping_sent_;
+    PingRegistry ping_sent_;
   };
 
   const NodeEntrance host_data_;

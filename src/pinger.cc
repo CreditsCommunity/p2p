@@ -4,7 +4,7 @@
 
 namespace net {
 
-RoutingTable::Pinger::Pinger(RoutingTable& rt) : routing_table_(rt) {}
+RoutingTable::Pinger::Pinger(RoutingTable& rt) : routing_table_(rt), ping_sent_(kPingExpirationSeconds) {}
 
 RoutingTable::Pinger::~Pinger() {
   Join();
@@ -60,12 +60,7 @@ void RoutingTable::Pinger::SendPing(const NodeEntrance& target, KBucket& bucket,
   PingDatagram ping(routing_table_.host_data_);
   {
    Guard g(ping_mux_);
-   auto it = ping_sent_.find(target.id);
-   if (it != ping_sent_.end()) {
-     it->second++;
-   } else {
-     ping_sent_.insert(std::make_pair(target.id, replacer ? kMaxPingsBeforeRemove : 0));
-   }
+   ping_sent_.Sent(target, replacer ? kMaxPingsBeforeRemove : 0, std::chrono::steady_clock::now());
   }
 
   routing_table_.socket_->Send(ping.ToUdp(target));
@@ -78,14 +73,14 @@ void RoutingTable::Pinger::SendPing(const NodeEntrance& target, KBucket& bucket,
                     {
                       std::scoped_lock g(ping_mux_, routing_table_.k_bucket_mux_);
 
-                      auto it = ping_sent_.find(target.id);
-                      if (it == ping_sent_.end()) {
+                      auto unanswered = ping_sent_.Unanswered(target.id);
+                      if (!unanswered) {
                         return;
                       }
 
-                      if (it->second >= kMaxPingsBeforeRemove) {
+                      if (*unanswered >= kMaxPingsBeforeRemove) {
                         resendPing = false;
-                        ping_sent_.erase(it);
+                        ping_sent_.Erase(target.id);
 
                         NodeEntrance evicted;
                         if (bucket.Get(target.id, evicted)) {
@@ -113,11 +108,12 @@ void RoutingTable::Pinger::SendPing(const NodeEntrance& target, KBucket& bucket,
 
 void RoutingTable::Pinger::Clear() {
   Guard g(ping_mux_);
-  ping_sent_.clear();
+  ping_sent_.Clear();
 }
 
 bool RoutingTable::Pinger::CheckPingResponce(const KademliaDatagram& d) {
   Guard g(ping_mux_);
-  return ping_sent_.erase(d.node_from.id) > 0;
+  // node_from carries the endpoint the datagram came from (KademliaDatagram::ReinterpretUdpPacket)
+  return ping_sent_.Answer(d.node_from, std::chrono::steady_clock::now());
 }
 } // namespace net

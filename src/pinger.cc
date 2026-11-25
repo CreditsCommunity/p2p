@@ -78,13 +78,6 @@ void RoutingTable::Pinger::SendPing(const NodeEntrance& target, KBucket& bucket,
                         return;
                       }
 
-                      // a response window of the entry's own endpoint expired with no answer
-                      NodeEntrance holder;
-                      const auto now = std::chrono::steady_clock::now();
-                      if (bucket.Get(target.id, holder) && ping_sent_.Overdue(holder, now)) {
-                        routing_table_.OnPingMissed(target.id);
-                      }
-
                       if (*unanswered >= kMaxPingsBeforeRemove) {
                         resendPing = false;
                         ping_sent_.Erase(target.id);
@@ -111,11 +104,6 @@ void RoutingTable::Pinger::SendPing(const NodeEntrance& target, KBucket& bucket,
                   };
 
   timer->async_wait(std::move(callback));
-}
-
-void RoutingTable::Pinger::Forget(const NodeId& id) {
-  Guard g(ping_mux_);
-  ping_sent_.Erase(id);
 }
 
 void RoutingTable::Pinger::Clear() {

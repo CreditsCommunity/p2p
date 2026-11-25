@@ -26,9 +26,12 @@ namespace net {
 // node that claims an id from another endpoint adds an entry of its own (at most kMaxEndpointsPerId per
 // id) and cannot replace, pin or refresh another endpoint's entry. An entry is "verified" only by a
 // ping response from its own endpoint within the response window of the latest ping Due gave for it
-// (Verified), and leaves only once that endpoint is back in the k-buckets (Remove, by the routing
-// table). Re-adding an entry never refreshes when it was lost, so it is forgotten kForgetAfter after
-// the first loss.
+// (Verified). It leaves only once that endpoint is back in the k-buckets and has answered a ping of
+// ours there (Remove, by the routing table). Nothing here ever displaces an entry of the k-buckets: a
+// lost peer whose id they hold at another endpoint is kept out by the endpoint check, as in the
+// official code, until the pinger evicts that holder (three unanswered pings); the lost entry is
+// pinged meanwhile and comes back by the usual add. Re-adding an entry never refreshes when it was
+// lost, so it is forgotten kForgetAfter after the first loss.
 //
 // Only a peer whose answer to a ping of ours was verified the same way while it was in the k-buckets
 // is kept (see PingRegistry), at most kMaxPeers entries; when full, the entry that had been answering
@@ -75,12 +78,16 @@ class LostPeers {
     return it->lost;
   }
 
-  // that id at that endpoint is back (the routing table holds it there)
-  void Remove(const NodeEntrance& node) {
+  // that id at that endpoint is back (the routing table holds it there and it answered a ping of
+  // ours there): when it was lost, if it was in the list
+  std::optional<Clock::time_point> Remove(const NodeEntrance& node) {
     auto it = Find(node);
-    if (it != peers_.end()) {
-      peers_.erase(it);
+    if (it == peers_.end()) {
+      return std::nullopt;
     }
+    auto lost = it->lost;
+    peers_.erase(it);
+    return lost;
   }
 
   bool Contains(const NodeId& id) const {
@@ -120,13 +127,14 @@ class LostPeers {
     return result;
   }
 
-  // every entry, the longest-answering first (an id may come with several endpoints)
+  // every entry, the most recently lost first (an id may come with several endpoints: the first one
+  // of an id is the endpoint it was last seen at)
   void Get(std::vector<NodeEntrance>& result) const {
     std::vector<const Entry*> sorted;
     for (const auto& e : peers_) {
       sorted.push_back(&e);
     }
-    std::stable_sort(sorted.begin(), sorted.end(), [](const Entry* a, const Entry* b) { return a->tenure > b->tenure; });
+    std::stable_sort(sorted.begin(), sorted.end(), [](const Entry* a, const Entry* b) { return a->lost > b->lost; });
     for (const auto* e : sorted) {
       result.push_back(e->node);
     }
@@ -179,30 +187,6 @@ class LostPeers {
 
   std::vector<Entry> peers_;
 };
-
-// How a k-bucket entry has answered our pings at its endpoint: the time of its latest verified answer
-// (PingRegistry::Answer) and the response windows that expired since then with no answer, counted
-// only by the pinger's timer when a window has really passed (PingRegistry::Overdue). A verified
-// answer clears the misses. Kept by the routing table under its k-bucket lock.
-struct Liveness {
-  std::optional<std::chrono::steady_clock::time_point> last_answer;
-  uint32_t missed = 0;
-};
-
-// A ping response verified for a lost entry (LostPeers::Verified) while the k-buckets hold its id at
-// another endpoint: that entry may take the verified endpoint only if it has stopped answering: at
-// least one response window has expired unanswered since its latest verified answer, and that answer
-// (if any) is older than a whole window. Sending pings counts for nothing, so a replacement ping
-// anyone can provoke does not make a live node look silent. An entry with no record (nothing has
-// expired for it yet) stays. A live, answering entry is never evicted for a returning one: the lost
-// entry stays and is pinged again.
-inline bool MayTakeOver(const std::optional<Liveness>& holder, std::chrono::steady_clock::time_point now,
-                        std::chrono::steady_clock::duration window) {
-  if (!holder || holder->missed == 0) {
-    return false;
-  }
-  return !holder->last_answer || now - *holder->last_answer > window;
-}
 
 } // namespace net
 #endif // NET_LOST_PEERS_H

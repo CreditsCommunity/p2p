@@ -55,6 +55,19 @@ class PingRegistry {
     return true;
   }
 
+  // The latest ping to that id went to `holder`'s endpoint (address, UDP port), is still unanswered,
+  // and its whole window has passed: a response window that really expired. The pinger asks this in
+  // its timer, never from the count of pings sent (which goes up when a ping is sent, and which a
+  // replacement ping provoked by anyone starts high).
+  bool Overdue(const NodeEntrance& holder, Clock::time_point now) const {
+    auto it = pings_.find(holder.id);
+    if (it == pings_.end()) {
+      return false;
+    }
+    const auto& p = it->second;
+    return p.address == holder.address && p.udp_port == holder.udp_port && now >= p.sent && now - p.sent >= window_;
+  }
+
   // the unanswered pings of an outstanding id
   std::optional<uint8_t> Unanswered(const NodeId& id) const {
     auto it = pings_.find(id);

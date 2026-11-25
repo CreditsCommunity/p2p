@@ -82,6 +82,7 @@ void RoutingTable::Reset(const std::vector<NodeEntrance>& nodes) {
     total_nodes_ = 0;
     // the lost peers stay: they are not in `nodes` and still to be pinged again
     answering_since_.clear();
+    liveness_.clear();
   }
   pinger_.Clear();
   explorer_.Clear();
@@ -191,7 +192,12 @@ void RoutingTable::PingLostAndBootNodes() {
   }
 }
 
+void RoutingTable::OnPingMissed(const NodeId& id) {
+  ++liveness_[id].missed;
+}
+
 void RoutingTable::OnEvicted(const NodeEntrance& node) {
+  liveness_.erase(node.id);
   auto it = answering_since_.find(node.id);
   if (it == answering_since_.end()) return;  // never answered a ping of ours
   const auto now = std::chrono::steady_clock::now();
@@ -245,7 +251,7 @@ void RoutingTable::OnPacketReceived(const bi::udp::endpoint& from, const ByteVec
   }
 
   if (lost_at) {
-    if (!TakeVerifiedEndpoint(packet->node_from, packet->has_user_data)) {
+    if (!TakeVerifiedEndpoint(packet->node_from)) {
       LOG(DEBUG) << "Rediscovery: " << IdToBase58(packet->node_from.id) << " answered at " << from.address() << ":"
                  << from.port() << ", but the routing table holds that id at another endpoint that still answers";
       return;
@@ -295,23 +301,27 @@ bool RoutingTable::HoldsEndpoint(const NodeEntrance& node) {
   return HasNode(node.id, held) && held.address == node.address && held.udp_port == node.udp_port;
 }
 
-bool RoutingTable::TakeVerifiedEndpoint(const NodeEntrance& node, bool has_user_data) {
-  // the pinger's count first (ping_mux_, then k_bucket_mux_ alone: never both here)
-  const auto unanswered = pinger_.Unanswered(node.id);
+bool RoutingTable::TakeVerifiedEndpoint(const NodeEntrance& node) {
   NodeEntrance squatter;
   {
+    // the holder's liveness and the bucket change under the same lock (the pinger's timer updates
+    // the liveness under it too)
     Guard g(k_bucket_mux_);
     auto index = KBucketIndex(node.id);
     if (index == kIvalidIndex) return false;
     if (!k_buckets_[index].Get(node.id, squatter)) return true;  // absent: added as any sender
     if (squatter.address == node.address && squatter.udp_port == node.udp_port) return true;
-    if (!MayTakeOver(answering_since_.count(node.id) > 0, unanswered)) return false;
-    k_buckets_[index].ReplaceEndpoint(node, has_user_data);
-    // what answered at the other endpoint was not this one: its answers do not count for it
+    auto live = liveness_.find(node.id);
+    const std::optional<Liveness> holder = live == liveness_.end() ? std::nullopt : std::optional<Liveness>(live->second);
+    if (!MayTakeOver(holder, std::chrono::steady_clock::now(), kPingExpirationSeconds)) return false;
+    k_buckets_[index].ReplaceEndpoint(node);
+    // what answered at the other endpoint was not this one: its record does not count for it
     answering_since_.erase(node.id);
+    liveness_.erase(node.id);
+    // the pings outstanding to the other endpoint would otherwise go on and evict the id
+    // (k_bucket_mux_ then ping_mux_, the order UpdateKBuckets takes them in)
+    pinger_.Forget(node.id);
   }
-  // the pings outstanding to the other endpoint would otherwise go on and evict the id
-  pinger_.Forget(node.id);
   LOG(WARNING) << "Rediscovery: " << IdToBase58(node.id) << " answered at its recorded endpoint " << node.address
                << ":" << node.udp_port << "; the routing table held that id at " << squatter.address << ":"
                << squatter.udp_port << ", which had stopped answering: replaced";
@@ -361,14 +371,18 @@ void RoutingTable::UpdateKBuckets(const NodeEntrance& node, bool answered, bool 
         bucket.Update(existing);
       }
       if (answered && same_endpoint) {
-        answering_since_.emplace(node.id, std::chrono::steady_clock::now());
+        const auto now = std::chrono::steady_clock::now();
+        answering_since_.emplace(node.id, now);
+        liveness_[node.id] = Liveness{now, 0};
       }
       bucket.Promote(node.id);
     } else if (bucket.Size() < k) {
       bucket.AddNode(node);
       ++total_nodes_;
       if (answered) {
-        answering_since_.emplace(node.id, std::chrono::steady_clock::now());
+        const auto now = std::chrono::steady_clock::now();
+        answering_since_.emplace(node.id, now);
+        liveness_[node.id] = Liveness{now, 0};
       }
       NotifyHost(node, RoutingTableEventType::kNodeAdded);
     } else {

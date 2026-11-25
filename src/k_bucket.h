@@ -18,9 +18,11 @@ class KBucket {
 
   void Update(const NodeEntrance&);
   // The node's entry takes the endpoint a verified ping response came from (address, UDP port) and
-  // the TCP port it announces (kept as announced, as UpdateKBuckets does), and its user data only if
-  // it carried some. False if the id is not here or is already at that address and UDP port.
-  bool ReplaceEndpoint(const NodeEntrance& verified, bool has_user_data);
+  // the TCP port it announces (kept as announced, as UpdateKBuckets does). Its user data (version,
+  // capabilities) is cleared, not copied: it is taken from the answer to the pinger's next ping of
+  // that endpoint, as for any entry. False if the id is not here or is already at that address and
+  // UDP port.
+  bool ReplaceEndpoint(const NodeEntrance& verified);
 
   void Promote(const NodeId&);
   void Evict(const NodeId&);
@@ -70,7 +72,7 @@ inline void KBucket::Update(const NodeEntrance& new_contacts) {
   *it = new_contacts;
 }
 
-inline bool KBucket::ReplaceEndpoint(const NodeEntrance& verified, bool has_user_data) {
+inline bool KBucket::ReplaceEndpoint(const NodeEntrance& verified) {
   auto it = std::find_if(nodes_.begin(), nodes_.end(),
                 [&verified](const NodeEntrance& e) { return e.id == verified.id; });
   if (it == nodes_.end()) return false;
@@ -78,7 +80,7 @@ inline bool KBucket::ReplaceEndpoint(const NodeEntrance& verified, bool has_user
   it->address = verified.address;
   it->udp_port = verified.udp_port;
   it->tcp_port = verified.tcp_port;
-  if (has_user_data) it->user_data = verified.user_data;
+  it->user_data = 0;
   return true;
 }
 

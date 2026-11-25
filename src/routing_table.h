@@ -126,7 +126,7 @@ class RoutingTable : public UdpSocketEventHandler {
   // as any other: the id is absent from the k-buckets, there at that endpoint already, or there at
   // another endpoint that has stopped answering, which then takes the verified one (MayTakeOver,
   // KBucket::ReplaceEndpoint). False if the entry at the other endpoint still answers: it stays.
-  bool TakeVerifiedEndpoint(const NodeEntrance&, bool has_user_data);
+  bool TakeVerifiedEndpoint(const NodeEntrance&);
   // the k-buckets hold that id at that address and UDP port
   bool HoldsEndpoint(const NodeEntrance&);
 
@@ -137,6 +137,8 @@ class RoutingTable : public UdpSocketEventHandler {
   // the pinger evicted this node of the k-buckets (k_bucket_mux_ held): kept as a lost peer if it
   // had answered a ping of ours
   void OnEvicted(const NodeEntrance&);
+  // the pinger's timer: a response window of that k-bucket entry expired unanswered (k_bucket_mux_ held)
+  void OnPingMissed(const NodeId&);
 
   static NodeId RandomId();
 
@@ -207,8 +209,6 @@ class RoutingTable : public UdpSocketEventHandler {
     bool CheckPingResponce(const KademliaDatagram&);
     // forgets the pings in flight (their timers then find nothing to do)
     void Clear();
-    // the unanswered pings counted for an id with a ping outstanding
-    std::optional<uint8_t> Unanswered(const NodeId&);
     // forgets the ping outstanding to that id (its timer then finds nothing to do)
     void Forget(const NodeId&);
 
@@ -236,6 +236,8 @@ class RoutingTable : public UdpSocketEventHandler {
   // since when each k-bucket node has been answering our pings (its first answer while in the
   // k-buckets); guarded by k_bucket_mux_
   std::unordered_map<NodeId, std::chrono::steady_clock::time_point> answering_since_;
+  // how each k-bucket node answers at its endpoint (MayTakeOver); guarded by k_bucket_mux_
+  std::unordered_map<NodeId, Liveness> liveness_;
 
   // after k_bucket_mux_ when both are held, never the other way round
   Mutex lost_mux_;

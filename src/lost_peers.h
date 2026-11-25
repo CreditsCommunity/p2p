@@ -180,13 +180,28 @@ class LostPeers {
   std::vector<Entry> peers_;
 };
 
+// How a k-bucket entry has answered our pings at its endpoint: the time of its latest verified answer
+// (PingRegistry::Answer) and the response windows that expired since then with no answer, counted
+// only by the pinger's timer when a window has really passed (PingRegistry::Overdue). A verified
+// answer clears the misses. Kept by the routing table under its k-bucket lock.
+struct Liveness {
+  std::optional<std::chrono::steady_clock::time_point> last_answer;
+  uint32_t missed = 0;
+};
+
 // A ping response verified for a lost entry (LostPeers::Verified) while the k-buckets hold its id at
-// another endpoint: that entry may take the verified endpoint only if it has stopped answering, i.e.
-// it never answered a ping of ours (verified, see PingRegistry) or it has missed one by now (the
-// pinger counts at least one unanswered ping for it). A live, answering entry is never evicted for a
-// returning one: the lost entry stays and is pinged again.
-inline bool MayTakeOver(bool entry_answered, std::optional<uint8_t> entry_unanswered_pings) {
-  return !entry_answered || entry_unanswered_pings.value_or(0) >= 1;
+// another endpoint: that entry may take the verified endpoint only if it has stopped answering: at
+// least one response window has expired unanswered since its latest verified answer, and that answer
+// (if any) is older than a whole window. Sending pings counts for nothing, so a replacement ping
+// anyone can provoke does not make a live node look silent. An entry with no record (nothing has
+// expired for it yet) stays. A live, answering entry is never evicted for a returning one: the lost
+// entry stays and is pinged again.
+inline bool MayTakeOver(const std::optional<Liveness>& holder, std::chrono::steady_clock::time_point now,
+                        std::chrono::steady_clock::duration window) {
+  if (!holder || holder->missed == 0) {
+    return false;
+  }
+  return !holder->last_answer || now - *holder->last_answer > window;
 }
 
 } // namespace net

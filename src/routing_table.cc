@@ -155,7 +155,7 @@ void RoutingTable::PingLostAndBootNodes() {
   const auto now = steady_clock::now();
 
   // the lost peers at their recorded endpoint, even when their id is in the k-buckets again: an entry
-  // leaves the list only when that endpoint answers (LostPeers::Answered, in OnPacketReceived)
+  // leaves the list only once that endpoint answers and is back in the k-buckets (OnPacketReceived)
   std::vector<NodeEntrance> targets;
   {
     Guard g(lost_mux_);
@@ -205,7 +205,7 @@ void RoutingTable::OnEvicted(const NodeEntrance& node) {
   }
   LOG(INFO) << "Rediscovery: " << IdToBase58(node.id) << " stopped answering after "
             << std::chrono::duration_cast<std::chrono::seconds>(tenure).count() << " s in the routing table"
-            << (kept ? ", it will be pinged again" : ", not kept (lost list full, or that id kept at another endpoint)");
+            << (kept ? ", it will be pinged again" : ", not kept (lost list full)");
 }
 
 std::vector<NodeEntrance> RoutingTable::GetBroadcastList(const NodeId& received_from) {
@@ -234,18 +234,22 @@ void RoutingTable::OnPacketReceived(const bi::udp::endpoint& from, const ByteVec
   auto packet = KademliaDatagram::ReinterpretUdpPacket(from, data);
   if (!packet) return;
 
-  // A lost peer answering, from the endpoint recorded when it was lost, the ping PingLostAndBootNodes
-  // sent it there. Verified before the endpoint check: a node that took its id in the k-buckets
-  // meanwhile, at another endpoint, would otherwise keep it out for good; the k-bucket entry takes the
-  // verified endpoint instead.
+  // A lost peer answering, from an endpoint recorded when it was lost, the ping PingLostAndBootNodes
+  // sent there (LostPeers::Verified). Checked before the endpoint check: an id taken meanwhile in the
+  // k-buckets at another endpoint by an entry that no longer answers would otherwise keep it out;
+  // that entry takes the verified endpoint. A live, answering entry stays (MayTakeOver).
   std::optional<std::chrono::steady_clock::time_point> lost_at;
   if (packet->DatagramType() == PingRespDatagram::type && packet->node_from.id != host_data_.id) {
     Guard g(lost_mux_);
-    lost_at = lost_.Answered(packet->node_from, std::chrono::steady_clock::now(), kPingExpirationSeconds);
+    lost_at = lost_.Verified(packet->node_from, std::chrono::steady_clock::now(), kPingExpirationSeconds);
   }
 
   if (lost_at) {
-    TakeVerifiedEndpoint(packet->node_from);
+    if (!TakeVerifiedEndpoint(packet->node_from, packet->has_user_data)) {
+      LOG(DEBUG) << "Rediscovery: " << IdToBase58(packet->node_from.id) << " answered at " << from.address() << ":"
+                 << from.port() << ", but the routing table holds that id at another endpoint that still answers";
+      return;
+    }
   } else if (!CheckEndpoint(*packet)) {
     LOG(DEBUG) << "Endpoint check failed from " << from.address() << ", " << from.port();
     return;
@@ -276,22 +280,42 @@ void RoutingTable::OnPacketReceived(const bi::udp::endpoint& from, const ByteVec
 
   UpdateKBuckets(packet->node_from, answered, refresh_user_data);
 
-  if (lost_at) {
+  // the lost entry leaves once that endpoint is in the k-buckets (not when its bucket is full)
+  if (lost_at && HoldsEndpoint(packet->node_from)) {
+    {
+      Guard g(lost_mux_);
+      lost_.Remove(packet->node_from);
+    }
     OnLostPeerBack(packet->node_from, *lost_at);
   }
 }
 
-void RoutingTable::TakeVerifiedEndpoint(const NodeEntrance& node) {
-  Guard g(k_bucket_mux_);
-  auto index = KBucketIndex(node.id);
-  if (index == kIvalidIndex) return;
+bool RoutingTable::HoldsEndpoint(const NodeEntrance& node) {
+  NodeEntrance held;
+  return HasNode(node.id, held) && held.address == node.address && held.udp_port == node.udp_port;
+}
+
+bool RoutingTable::TakeVerifiedEndpoint(const NodeEntrance& node, bool has_user_data) {
+  // the pinger's count first (ping_mux_, then k_bucket_mux_ alone: never both here)
+  const auto unanswered = pinger_.Unanswered(node.id);
   NodeEntrance squatter;
-  if (!k_buckets_[index].Get(node.id, squatter) || !k_buckets_[index].ReplaceEndpoint(node)) return;
-  // whatever answered at the other endpoint was not this node: its answers do not count for it
-  answering_since_.erase(node.id);
+  {
+    Guard g(k_bucket_mux_);
+    auto index = KBucketIndex(node.id);
+    if (index == kIvalidIndex) return false;
+    if (!k_buckets_[index].Get(node.id, squatter)) return true;  // absent: added as any sender
+    if (squatter.address == node.address && squatter.udp_port == node.udp_port) return true;
+    if (!MayTakeOver(answering_since_.count(node.id) > 0, unanswered)) return false;
+    k_buckets_[index].ReplaceEndpoint(node, has_user_data);
+    // what answered at the other endpoint was not this one: its answers do not count for it
+    answering_since_.erase(node.id);
+  }
+  // the pings outstanding to the other endpoint would otherwise go on and evict the id
+  pinger_.Forget(node.id);
   LOG(WARNING) << "Rediscovery: " << IdToBase58(node.id) << " answered at its recorded endpoint " << node.address
                << ":" << node.udp_port << "; the routing table held that id at " << squatter.address << ":"
-               << squatter.udp_port << ", replaced";
+               << squatter.udp_port << ", which had stopped answering: replaced";
+  return true;
 }
 
 bool RoutingTable::CheckEndpoint(const KademliaDatagram& d) {

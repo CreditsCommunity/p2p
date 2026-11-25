@@ -106,6 +106,16 @@ void RoutingTable::Pinger::SendPing(const NodeEntrance& target, KBucket& bucket,
   timer->async_wait(std::move(callback));
 }
 
+std::optional<uint8_t> RoutingTable::Pinger::Unanswered(const NodeId& id) {
+  Guard g(ping_mux_);
+  return ping_sent_.Unanswered(id);
+}
+
+void RoutingTable::Pinger::Forget(const NodeId& id) {
+  Guard g(ping_mux_);
+  ping_sent_.Erase(id);
+}
+
 void RoutingTable::Pinger::Clear() {
   Guard g(ping_mux_);
   ping_sent_.Clear();

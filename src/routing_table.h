@@ -122,9 +122,13 @@ class RoutingTable : public UdpSocketEventHandler {
   // node listed by another one (FindNode replies) is never written here.
   void UpdateKBuckets(const NodeEntrance& sender, bool answered, bool refresh_user_data);
 
-  // A lost peer answered our ping from its recorded endpoint: if the k-buckets hold its id at another
-  // endpoint (taken meanwhile by whoever claimed that id), the entry takes the verified one.
-  void TakeVerifiedEndpoint(const NodeEntrance&);
+  // A lost peer answered our ping from a recorded endpoint (verified). True if the datagram may go on
+  // as any other: the id is absent from the k-buckets, there at that endpoint already, or there at
+  // another endpoint that has stopped answering, which then takes the verified one (MayTakeOver,
+  // KBucket::ReplaceEndpoint). False if the entry at the other endpoint still answers: it stays.
+  bool TakeVerifiedEndpoint(const NodeEntrance&, bool has_user_data);
+  // the k-buckets hold that id at that address and UDP port
+  bool HoldsEndpoint(const NodeEntrance&);
 
   // a lost peer answered our ping from its recorded endpoint and left the lost list: logged, and a
   // lookup through it so that its side learns of us and we of its side
@@ -203,6 +207,10 @@ class RoutingTable : public UdpSocketEventHandler {
     bool CheckPingResponce(const KademliaDatagram&);
     // forgets the pings in flight (their timers then find nothing to do)
     void Clear();
+    // the unanswered pings counted for an id with a ping outstanding
+    std::optional<uint8_t> Unanswered(const NodeId&);
+    // forgets the ping outstanding to that id (its timer then finds nothing to do)
+    void Forget(const NodeId&);
 
    private:
     void PingRoutine(std::future<void>&&);

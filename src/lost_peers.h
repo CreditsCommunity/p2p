@@ -16,77 +16,71 @@ namespace net {
 // network cut every node of the other side is evicted that way, and nothing sends it a datagram again:
 // the k-buckets keep only the reachable side, the lookups ask only that side, and the boot nodes are
 // looked up again only when the table is empty. The two sides then never find each other when the
-// connection comes back. A lost peer is pinged again (one datagram) at the endpoint recorded here, with
-// a backoff; its answer brings it back into the k-buckets like any datagram, and our ping makes it add
-// us back too.
+// connection comes back. A lost peer is pinged again (one datagram) at its recorded endpoint, with a
+// backoff; its answer brings it back into the k-buckets, and our ping makes it add us back too.
 //
-// A peer leaves the list only when it answers one of these pings: a ping response from the recorded
-// endpoint (address and UDP port) within the response window of the latest ping to it (Answered). A
-// datagram that only claims its id from another endpoint (a node may name itself anything), or the id
-// showing up in the k-buckets, changes nothing: the entry stays and its endpoint is still pinged.
+// Trust model. A node id is a public key, but nothing in the p2p protocol proves it: a datagram's id is
+// the sender's word, and an official peer's ping response carries no nonce or signature (it is built
+// from the peer's own host data) and cannot be made to. So ids are unauthenticated, as in the official
+// Kademlia; what is bound is the endpoint. Entries are kept per endpoint, (id, address, UDP port): a
+// node that claims an id from another endpoint adds an entry of its own (at most kMaxEndpointsPerId per
+// id) and cannot replace, pin or refresh another endpoint's entry. An entry is "verified" only by a
+// ping response from its own endpoint within the response window of the latest ping Due gave for it
+// (Verified), and leaves only once that endpoint is back in the k-buckets (Remove, by the routing
+// table). Re-adding an entry never refreshes when it was lost, so it is forgotten kForgetAfter after
+// the first loss.
 //
 // Only a peer whose answer to a ping of ours was verified the same way while it was in the k-buckets
-// is kept (see PingRegistry), at most kMaxPeers of them; when the list is full, the one that had been
-// answering for the shortest time leaves first, so ids that come and go quickly cannot push out the
-// peers of a long cut. A peer is forgotten kForgetAfter after it was lost. Not thread-safe: the
-// routing table guards it.
+// is kept (see PingRegistry), at most kMaxPeers entries; when full, the entry that had been answering
+// for the shortest time leaves first, so ids that come and go quickly cannot push out the peers of a
+// long cut. Not thread-safe: the routing table guards it.
 class LostPeers {
  public:
   using Clock = std::chrono::steady_clock;
 
   static constexpr size_t kMaxPeers = 64;
+  static constexpr size_t kMaxEndpointsPerId = 4;
   // pings sent per call of Due (the pinger calls it every 8 s)
   static constexpr size_t kMaxPerCall = 16;
   static constexpr std::chrono::seconds kFirstRetry{30};
   static constexpr std::chrono::seconds kMaxRetry{180};
   static constexpr std::chrono::hours kForgetAfter{24};
 
-  // `tenure`: how long the peer had been answering in the k-buckets. False if it was not kept: the
-  // list is full of peers with a tenure at least as long, or it already holds that id at another
-  // endpoint. The first endpoint recorded for an id stays, with its own tenure: a node that took the
-  // id meanwhile at another endpoint (anyone can claim any id) and was evicted in turn neither
-  // replaces it nor inherits its tenure. A peer that really moved comes back by its own pings.
+  // `tenure`: how long the peer had been answering at that endpoint in the k-buckets. An entry already
+  // there for the same id and endpoint keeps its loss time and schedule (only a longer tenure is
+  // taken). False if not kept: the list, or the id's endpoints, are full of entries with a tenure at
+  // least as long.
   bool Add(const NodeEntrance& node, Clock::duration tenure, Clock::time_point now) {
-    auto it = Find(node.id);
-    if (it != peers_.end() && (it->node.address != node.address || it->node.udp_port != node.udp_port)) {
-      return false;
-    }
+    auto it = Find(node);
     if (it != peers_.end()) {
-      it->node = node;
       it->tenure = std::max(it->tenure, tenure);
-      it->lost = now;
-      it->next = now + kFirstRetry;
-      it->attempts = 0;
-      it->pinged.reset();
       return true;
     }
-    if (peers_.size() >= kMaxPeers) {
-      auto shortest = std::min_element(peers_.begin(), peers_.end(),
-                                       [](const Entry& a, const Entry& b) { return a.tenure < b.tenure; });
-      if (shortest->tenure >= tenure) {
-        return false;
-      }
-      peers_.erase(shortest);
+    if (!MakeRoom([&node](const Entry& e) { return e.node.id == node.id; }, kMaxEndpointsPerId, tenure) ||
+        !MakeRoom([](const Entry&) { return true; }, kMaxPeers, tenure)) {
+      return false;
     }
     peers_.push_back(Entry{node, tenure, now, now + kFirstRetry, 0, std::nullopt});
     return true;
   }
 
   // `from` (an id and the endpoint its ping response came from) answers the latest ping Due gave for
-  // that id: the recorded address and UDP port, within `window` of that ping. The peer then leaves the
-  // list and the result is when it was lost; otherwise nothing changes.
-  std::optional<Clock::time_point> Answered(const NodeEntrance& from, Clock::time_point now, Clock::duration window) {
-    auto it = Find(from.id);
-    if (it == peers_.end() || !it->pinged) {
+  // that entry: the same id, address and UDP port, within `window` of that ping. The result is when it
+  // was lost; nothing changes (Remove, once it is back in the k-buckets at that endpoint).
+  std::optional<Clock::time_point> Verified(const NodeEntrance& from, Clock::time_point now, Clock::duration window) const {
+    auto it = std::find_if(peers_.begin(), peers_.end(), [&from](const Entry& e) { return SameEndpoint(e.node, from); });
+    if (it == peers_.end() || !it->pinged || now < *it->pinged || now - *it->pinged > window) {
       return std::nullopt;
     }
-    if (it->node.address != from.address || it->node.udp_port != from.udp_port ||
-        now < *it->pinged || now - *it->pinged > window) {
-      return std::nullopt;
+    return it->lost;
+  }
+
+  // that id at that endpoint is back (the routing table holds it there)
+  void Remove(const NodeEntrance& node) {
+    auto it = Find(node);
+    if (it != peers_.end()) {
+      peers_.erase(it);
     }
-    auto lost = it->lost;
-    peers_.erase(it);
-    return lost;
   }
 
   bool Contains(const NodeId& id) const {
@@ -95,10 +89,10 @@ class LostPeers {
 
   size_t Size() const noexcept { return peers_.size(); }
 
-  // The peers to ping now, at their recorded endpoint whatever the k-buckets hold for their ids: at
-  // most kMaxPerCall, the longest waiting first; the time of each ping is recorded (Answered). Each
-  // one's next ping moves out: kFirstRetry after it was lost, then twice the previous wait each time
-  // up to kMaxRetry. The peers lost kForgetAfter ago or longer are forgotten.
+  // The entries to ping now, at their endpoints whatever the k-buckets hold for their ids: at most
+  // kMaxPerCall, the longest waiting first; the time of each ping is recorded (Verified). Each one's
+  // next ping moves out: kFirstRetry after it was lost, then twice the previous wait each time up to
+  // kMaxRetry. Entries lost kForgetAfter ago or longer are forgotten.
   std::vector<NodeEntrance> Due(Clock::time_point now) {
     peers_.erase(std::remove_if(peers_.begin(), peers_.end(),
                                 [now](const Entry& e) { return now - e.lost >= kForgetAfter; }),
@@ -126,9 +120,15 @@ class LostPeers {
     return result;
   }
 
+  // every entry, the longest-answering first (an id may come with several endpoints)
   void Get(std::vector<NodeEntrance>& result) const {
+    std::vector<const Entry*> sorted;
     for (const auto& e : peers_) {
-      result.push_back(e.node);
+      sorted.push_back(&e);
+    }
+    std::stable_sort(sorted.begin(), sorted.end(), [](const Entry* a, const Entry* b) { return a->tenure > b->tenure; });
+    for (const auto* e : sorted) {
+      result.push_back(e->node);
     }
   }
 
@@ -139,6 +139,10 @@ class LostPeers {
       wait *= 2;
     }
     return std::min<Clock::duration>(wait, kMaxRetry);
+  }
+
+  static bool SameEndpoint(const NodeEntrance& a, const NodeEntrance& b) {
+    return a.id == b.id && a.address == b.address && a.udp_port == b.udp_port;
   }
 
  private:
@@ -152,12 +156,38 @@ class LostPeers {
     std::optional<Clock::time_point> pinged;
   };
 
-  std::vector<Entry>::iterator Find(const NodeId& id) {
-    return std::find_if(peers_.begin(), peers_.end(), [&id](const Entry& e) { return e.node.id == id; });
+  std::vector<Entry>::iterator Find(const NodeEntrance& node) {
+    return std::find_if(peers_.begin(), peers_.end(), [&node](const Entry& e) { return SameEndpoint(e.node, node); });
+  }
+
+  // at most `cap` entries matching `pred` once one is added: the shortest tenure among them leaves if
+  // shorter than `tenure`; false if none does
+  template <class Pred>
+  bool MakeRoom(Pred pred, size_t cap, Clock::duration tenure) {
+    size_t count = 0;
+    auto shortest = peers_.end();
+    for (auto it = peers_.begin(); it != peers_.end(); ++it) {
+      if (!pred(*it)) continue;
+      ++count;
+      if (shortest == peers_.end() || it->tenure < shortest->tenure) shortest = it;
+    }
+    if (count < cap) return true;
+    if (shortest->tenure >= tenure) return false;
+    peers_.erase(shortest);
+    return true;
   }
 
   std::vector<Entry> peers_;
 };
+
+// A ping response verified for a lost entry (LostPeers::Verified) while the k-buckets hold its id at
+// another endpoint: that entry may take the verified endpoint only if it has stopped answering, i.e.
+// it never answered a ping of ours (verified, see PingRegistry) or it has missed one by now (the
+// pinger counts at least one unanswered ping for it). A live, answering entry is never evicted for a
+// returning one: the lost entry stays and is pinged again.
+inline bool MayTakeOver(bool entry_answered, std::optional<uint8_t> entry_unanswered_pings) {
+  return !entry_answered || entry_unanswered_pings.value_or(0) >= 1;
+}
 
 } // namespace net
 #endif // NET_LOST_PEERS_H

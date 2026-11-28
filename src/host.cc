@@ -317,6 +317,9 @@ bool Host::RefuseMisdirected(const Packet& reg, const Connection::Ptr& conn) {
 }
 
 void Host::WarnAnnouncedHere(const NodeId& other, const char* how) {
+  // once per id every kWarnInterval_, and at most kMaxWarnLines_ lines in such a window whatever the
+  // ids: a peer that dials with random receiver ids gets a count, not a line per connection
+  uint64_t suppressed = 0;
   {
     Guard g(self_check_mux_);
     const auto now = std::chrono::steady_clock::now();
@@ -324,6 +327,17 @@ void Host::WarnAnnouncedHere(const NodeId& other, const char* how) {
     if (it != warned_announced_.end() && now - it->second < kWarnInterval_) {
       return;
     }
+    if (now - warn_window_start_ >= kWarnInterval_) {
+      warn_window_start_ = now;
+      warn_lines_ = 0;
+    }
+    if (warn_lines_ >= kMaxWarnLines_) {
+      ++warn_suppressed_;
+      return;
+    }
+    ++warn_lines_;
+    suppressed = warn_suppressed_;
+    warn_suppressed_ = 0;
     if (warned_announced_.size() >= kMaxWarned_) {
       warned_announced_.clear();
     }
@@ -332,7 +346,8 @@ void Host::WarnAnnouncedHere(const NodeId& other, const char* how) {
   // p2p WARNING lines go nowhere (utils/log.cc): INFO reaches the console and debug.log
   LOG(INFO) << "WARNING: another node, " << IdToBase58(other) << ", is announced at this node's address ("
             << how << "). Two nodes behind one public address need different p2p ports, each forwarded "
-            << "to its own node: the other node's operator must change its port";
+            << "to its own node: the other node's operator must change its port"
+            << (suppressed ? " (and " + std::to_string(suppressed) + " more such connection(s) not logged)" : std::string());
 }
 
 void Host::ScheduleSelfCheck(std::chrono::seconds after) {
@@ -340,6 +355,21 @@ void Host::ScheduleSelfCheck(std::chrono::seconds after) {
   self_check_timer_->async_wait([this](const boost::system::error_code& e) {
                                   if (e == ba::error::operation_aborted) {
                                     return;
+                                  }
+                                  // the previous check: every dial of its own address failed, none answered
+                                  bool hint = false;
+                                  {
+                                    Guard g(self_check_mux_);
+                                    hint = probe_failed_ && !probe_answered_;
+                                    probe_failed_ = probe_answered_ = false;
+                                  }
+                                  if (hint) {
+                                    LOG(INFO) << "Hint: nobody answered at the address the peers record for this "
+                                              << "node. If it should accept incoming connections, check that its p2p "
+                                              << "port is forwarded to it (some routers do not loop a connection to their "
+                                              << "own public address back: then this hint is moot); a node without a "
+                                              << "forwarded port still "
+                                              << "works through the connections it opens itself";
                                   }
                                   routing_table_->StartFindNode(my_id_);
                                   ScheduleSelfCheck(kSelfCheckInterval_);
@@ -384,16 +414,21 @@ void Host::ProbeEndpoint(const bi::address& address, uint16_t tcp_port) {
 
 void Host::OnOwnEndpointAnswered(const NodeId& answered_by, const Connection::Ptr& conn) {
   const std::string ep = EndpointText(conn);
+  bool first_answer = false;
+  {
+    Guard g(self_check_mux_);
+    probe_answered_ = true;
+    if (answered_by == my_id_ && !reachable_reported_) {
+      reachable_reported_ = first_answer = true;
+    }
+  }
   if (answered_by != my_id_) {
     LOG(ERROR) << "Another node, " << IdToBase58(answered_by) << ", answers at this node's address " << ep
                << ": the peers record this node there and their connections reach that node instead. Two "
                << "nodes behind one public address need different p2p ports, each forwarded to its own "
-               << "node: give this node another port ([host_input] port) and forward it to this node";
-    return;
-  }
-  Guard g(self_check_mux_);
-  if (!reachable_reported_) {
-    reachable_reported_ = true;
+               << "node: give this node another port ([host_input] port) and forward it to this node "
+               << "(checked again every 10 minutes: after a change of address one such line can be stale)";
+  } else if (first_answer) {
     LOG(INFO) << "This node answers at the address its peers record for it: " << ep;
   }
 }
@@ -537,7 +572,10 @@ void Host::StartAccept() {
 void Host::OnConnected(Packet&& conn_pack, Connection::Ptr new_conn) {
   const auto& remote_node = conn_pack.header.sender;
 
-  // this node's probe of its own address (ProbeOwnEndpoint): never taken
+  // this node's probe of its own address (ProbeOwnEndpoint): never taken. Answered by an official
+  // node, that node takes the probe under this node's id and, once it is closed here, its
+  // OnConnectionDropped erases its passive connections with this node: once every 10 minutes, and only
+  // while the misconfiguration this reports lasts (accepted)
   if (new_conn->IsActive() && new_conn->RemoteNode() == my_id_) {
     OnOwnEndpointAnswered(remote_node, new_conn);
     new_conn->Abandon();
@@ -649,6 +687,15 @@ void Host::CheckSendQueue(const NodeId& id, Connection::Ptr conn) {
 }
 
 void Host::OnPendingConnectionError(const NodeId& id, Connection::DropReason drop_reason) {
+  // a probe of this node's own address (ProbeOwnEndpoint) that nobody answered: not a dial, no
+  // unreachable or pending bookkeeping; the next self-check gives a hint if no probe answered
+  if (id == my_id_) {
+    LOG(DEBUG) << "Nobody answered the probe of this node's own address, reason "
+               << Connection::DropReasonToString(drop_reason);
+    Guard g(self_check_mux_);
+    probe_failed_ = true;
+    return;
+  }
   LOG(DEBUG) << "Pending connection with " << IdToBase58(id)
             << " was closed, reason " << Connection::DropReasonToString(drop_reason);
 

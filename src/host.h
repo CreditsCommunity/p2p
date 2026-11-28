@@ -175,6 +175,12 @@ class Host : public RoutingTableEventHandler, public BanManOwner, public Connect
   std::map<std::string, std::chrono::steady_clock::time_point> probed_endpoints_;
   std::unordered_map<NodeId, std::chrono::steady_clock::time_point> warned_announced_;
   bool reachable_reported_ = false;
+  constexpr static size_t kMaxWarnLines_ = 4;
+  std::chrono::steady_clock::time_point warn_window_start_{};
+  size_t warn_lines_ = 0;
+  uint64_t warn_suppressed_ = 0;
+  bool probe_answered_ = false;
+  bool probe_failed_ = false;
 };
 } // namespace net
 #endif // NET_HOST_H

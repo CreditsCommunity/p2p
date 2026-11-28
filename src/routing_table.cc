@@ -409,11 +409,16 @@ std::vector<NodeEntrance> RoutingTable::NearestNodes(const NodeId& target) {
 }
 
 void RoutingTable::OnNodeFound(const NodeEntrance& node) {
-  if (node.id == host_data_.id) return;
+  if (node.id == host_data_.id) {
+    NotifyHost(node, RoutingTableEventType::kOwnEndpointFound);
+    return;
+  }
   NotifyHost(node, RoutingTableEventType::kNodeFound);
 }
 
 void RoutingTable::OnNodeNotFound(const NodeId& id) {
+  // a lookup of this node's own id (Host's check of its address) that no peer answered
+  if (id == host_data_.id) return;
   NodeEntrance node;
   node.id = id;
   NotifyHost(node, RoutingTableEventType::kNodeNotFound);

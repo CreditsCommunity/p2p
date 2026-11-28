@@ -51,6 +51,10 @@ class Connection : public std::enable_shared_from_this<Connection> {
   bool IsConnected() const;
   // dropped or abandoned: it sends nothing more and its owner must not take it
   bool IsDropped() const noexcept { return dropped_; }
+  // a registered passive connection its owner did not take (a dial meant for another node, see
+  // Host::RefuseMisdirected): its end is reported to nobody
+  void MarkNotTaken() noexcept { not_taken_ = true; }
+  bool IsNotTaken() const noexcept { return not_taken_; }
   // the node this connection was dialled to (active), or the registered sender (passive)
   const NodeId& RemoteNode() const noexcept { return remote_node_; }
 
@@ -85,6 +89,7 @@ class Connection : public std::enable_shared_from_this<Connection> {
   std::atomic<bool> registation_passed_ = false;
   std::atomic<bool> dropped_ = false;
   std::atomic<bool> timer_started_ = false;
+  std::atomic<bool> not_taken_ = false;
   const bool active_;
 
   NodeId remote_node_;

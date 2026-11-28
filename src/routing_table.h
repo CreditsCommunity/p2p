@@ -25,7 +25,9 @@ enum class RoutingTableEventType {
   kNodeAdded,
   kNodeRemoved,
   kNodeFound,
-  kNodeNotFound
+  kNodeNotFound,
+  // a lookup of this node's own id found it in a peer's table: the endpoint the peers record for it
+  kOwnEndpointFound
 };
 
 // Routing table's owner must implement this interface

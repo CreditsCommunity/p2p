@@ -2,7 +2,9 @@
 #define NET_HOST_H
 
 #include <chrono>
+#include <map>
 #include <memory>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <thread>
@@ -96,6 +98,30 @@ class Host : public RoutingTableEventHandler, public BanManOwner, public Connect
   void Connect(const NodeEntrance&);
   Connection::Ptr IsConnected(const NodeId&);
 
+  // Two nodes behind one public address that announce the same p2p port: the peers record both at
+  // the address forwarded to one of them, and their dials for the other reach that one.
+  // A registration flag in header.reserved, which other nodes neither check nor use: the dialler drops
+  // an answer from another id than the one it dialled (OnConnected), so a node it did not mean to
+  // reach may answer it with its own registration and tell it who is at that address.
+  constexpr static uint32_t kRegAnswerAnyway = 0x1;
+  Packet FormRegistration(const NodeId& receiver);
+  // a passive connection whose registration names another node (or this node as the sender): never
+  // taken. A dialler that set kRegAnswerAnyway gets this node's registration; any other one (the
+  // official p2p, which takes an answer under the id that answers) is closed without one: taken, the
+  // answer would be a second connection with this node that its multimap puts first for its sends,
+  // the first connection would time out unused, and the official OnConnectionDropped erases every
+  // connection of that direction, the second one too: it could no longer send to this node
+  bool RefuseMisdirected(const Packet& reg, const Connection::Ptr&);
+  // once per node every kWarnInterval_: the operator learns that another node is announced here
+  void WarnAnnouncedHere(const NodeId& other, const char* how);
+  // every kSelfCheckInterval_ (the first one kSelfCheckFirst_ after the start) a lookup of this node's
+  // own id; the endpoint a peer records for it is dialled (ProbeOwnEndpoint) and the node that answers
+  // there is checked (OnOwnEndpointAnswered): another one means this node's port is not forwarded to
+  // it and its peers reach that node instead
+  void ScheduleSelfCheck(std::chrono::seconds after);
+  void ProbeOwnEndpoint(const NodeEntrance& seen);
+  void OnOwnEndpointAnswered(const NodeId& answered_by, const Connection::Ptr&);
+
   void RemoveFromPendingConn(const NodeId&);
   bool HasPendingConnection(const NodeId&);
 
@@ -138,6 +164,16 @@ class Host : public RoutingTableEventHandler, public BanManOwner, public Connect
   std::unordered_map<NodeId, std::chrono::steady_clock::time_point> unreachable_peers_;
 
   std::unique_ptr<BanMan> ban_man_ = nullptr;
+
+  constexpr static std::chrono::seconds kSelfCheckFirst_{120};
+  constexpr static std::chrono::seconds kSelfCheckInterval_{600};
+  constexpr static std::chrono::seconds kWarnInterval_{600};
+  constexpr static size_t kMaxWarned_ = 64;
+  std::unique_ptr<DeadlineTimer> self_check_timer_;
+  Mutex self_check_mux_;
+  std::map<std::string, std::chrono::steady_clock::time_point> probed_endpoints_;
+  std::unordered_map<NodeId, std::chrono::steady_clock::time_point> warned_announced_;
+  bool reachable_reported_ = false;
 };
 } // namespace net
 #endif // NET_HOST_H

@@ -32,6 +32,8 @@ Host::Host(const Config& config, HostEventHandler& event_handler)
   ban_man_ = std::make_unique<BanMan>(kBanFileName, static_cast<BanManOwner&>(*this),
       routing_table_);
 
+  self_check_timer_ = std::make_unique<DeadlineTimer>(io_);
+
   TcpListen();
 }
 
@@ -57,6 +59,8 @@ void Host::Run() {
   routing_table_->AddNodes(
           config.use_default_boot_nodes ?
           GetDefaultBootNodes() : config.custom_boot_nodes);
+
+  ScheduleSelfCheck(kSelfCheckFirst_);
 
   working_thread_ = std::thread([this] { io_.run(); });
 }
@@ -112,6 +116,10 @@ void Host::HandleRoutTableEvent(const NodeEntrance& node, RoutingTableEventType 
     case RoutingTableEventType::kNodeRemoved :
       LOG(DEBUG) << "ROUTING TABLE: remove " << IdToBase58(node.id);
       event_handler_.OnNodeRemoved(node.id);
+      break;
+
+    case RoutingTableEventType::kOwnEndpointFound :
+      ProbeOwnEndpoint(node);
       break;
   }
 }
@@ -261,10 +269,120 @@ void Host::Connect(const NodeEntrance& peer) {
     Guard g(pend_conn_mux_);
     pending_dials_[peer.id] = new_conn;
   }
-  new_conn->Connect(Connection::Endpoint(peer.address, peer.tcp_port),
-                    FormPacket(Packet::Type::kRegistration,
-                               Network::Instance().GetRegistrationData(),
-                               peer.id));
+  new_conn->Connect(Connection::Endpoint(peer.address, peer.tcp_port), FormRegistration(peer.id));
+}
+
+Packet Host::FormRegistration(const NodeId& receiver) {
+  auto reg = FormPacket(Packet::Type::kRegistration, Network::Instance().GetRegistrationData(), receiver);
+  reg.header.reserved |= kRegAnswerAnyway;
+  return reg;
+}
+
+namespace {
+std::string EndpointText(const Connection::Ptr& conn) {
+  // GetEndpoint throws once the socket is closed
+  try {
+    auto ep = conn->GetEndpoint();
+    return ep.address().to_string() + ":" + std::to_string(ep.port());
+  } catch (...) {
+    return "?";
+  }
+}
+} // namespace
+
+bool Host::RefuseMisdirected(const Packet& reg, const Connection::Ptr& conn) {
+  const NodeId& meant = reg.header.receiver;
+  const NodeId& from = reg.header.sender;
+  // a registration names the node dialled (a zero id: none, taken as for this node)
+  const bool for_another = meant != my_id_ && meant != NodeId();
+  const bool from_self = from == my_id_;
+  if (!for_another && !from_self) {
+    return false;
+  }
+
+  conn->MarkNotTaken();
+  if (for_another && !from_self) {
+    WarnAnnouncedHere(meant, "a peer dialled it and reached this node: its connection is refused");
+  }
+  if (reg.header.reserved & kRegAnswerAnyway) {
+    // the dialler drops this answer (it names another node than the one dialled) and logs who answered
+    conn->Send(FormPacket(Packet::Type::kRegistration, Network::Instance().GetRegistrationData(), from));
+    LOG(DEBUG) << "Connection from " << IdToBase58(from) << " meant for " << IdToBase58(meant)
+               << ": answered, not taken";
+  } else {
+    conn->Abandon();
+    LOG(DEBUG) << "Connection from " << IdToBase58(from) << " meant for " << IdToBase58(meant) << ": refused";
+  }
+  return true;
+}
+
+void Host::WarnAnnouncedHere(const NodeId& other, const char* how) {
+  {
+    Guard g(self_check_mux_);
+    const auto now = std::chrono::steady_clock::now();
+    auto it = warned_announced_.find(other);
+    if (it != warned_announced_.end() && now - it->second < kWarnInterval_) {
+      return;
+    }
+    if (warned_announced_.size() >= kMaxWarned_) {
+      warned_announced_.clear();
+    }
+    warned_announced_[other] = now;
+  }
+  // p2p WARNING lines go nowhere (utils/log.cc): INFO reaches the console and debug.log
+  LOG(INFO) << "WARNING: another node, " << IdToBase58(other) << ", is announced at this node's address ("
+            << how << "). Two nodes behind one public address need different p2p ports, each forwarded "
+            << "to its own node: the other node's operator must change its port";
+}
+
+void Host::ScheduleSelfCheck(std::chrono::seconds after) {
+  self_check_timer_->expires_from_now(boost::posix_time::seconds(after.count()));
+  self_check_timer_->async_wait([this](const boost::system::error_code& e) {
+                                  if (e == ba::error::operation_aborted) {
+                                    return;
+                                  }
+                                  routing_table_->StartFindNode(my_id_);
+                                  ScheduleSelfCheck(kSelfCheckInterval_);
+                                });
+}
+
+void Host::ProbeOwnEndpoint(const NodeEntrance& seen) {
+  if (seen.address.is_unspecified() || seen.tcp_port == 0 || IsEndpointBanned(seen.address, seen.tcp_port)) {
+    return;
+  }
+  const std::string key = seen.address.to_string() + ":" + std::to_string(seen.tcp_port);
+  {
+    Guard g(self_check_mux_);
+    const auto now = std::chrono::steady_clock::now();
+    auto it = probed_endpoints_.find(key);
+    if (it != probed_endpoints_.end() && now - it->second < kSelfCheckInterval_ - std::chrono::seconds(30)) {
+      return;
+    }
+    if (probed_endpoints_.size() >= kMaxWarned_) {
+      probed_endpoints_.clear();
+    }
+    probed_endpoints_[key] = now;
+  }
+  LOG(DEBUG) << "Checking the address a peer records for this node: " << key;
+  // not a pending dial: OnConnected recognises it by the id dialled (this node's own)
+  auto conn = Connection::Create(static_cast<ConnectionOwner&>(*this), io_);
+  conn->Connect(Connection::Endpoint(seen.address, seen.tcp_port), FormRegistration(my_id_));
+}
+
+void Host::OnOwnEndpointAnswered(const NodeId& answered_by, const Connection::Ptr& conn) {
+  const std::string ep = EndpointText(conn);
+  if (answered_by != my_id_) {
+    LOG(ERROR) << "Another node, " << IdToBase58(answered_by) << ", answers at this node's address " << ep
+               << ": the peers record this node there and their connections reach that node instead. Two "
+               << "nodes behind one public address need different p2p ports, each forwarded to its own "
+               << "node: give this node another port ([host_input] port) and forward it to this node";
+    return;
+  }
+  Guard g(self_check_mux_);
+  if (!reachable_reported_) {
+    reachable_reported_ = true;
+    LOG(INFO) << "This node answers at the address its peers record for it: " << ep;
+  }
 }
 
 void Host::AddKnownNodes(const std::vector<NodeEntrance>& nodes) {
@@ -406,6 +524,18 @@ void Host::StartAccept() {
 void Host::OnConnected(Packet&& conn_pack, Connection::Ptr new_conn) {
   const auto& remote_node = conn_pack.header.sender;
 
+  // this node's probe of its own address (ProbeOwnEndpoint): never taken
+  if (new_conn->IsActive() && new_conn->RemoteNode() == my_id_) {
+    OnOwnEndpointAnswered(remote_node, new_conn);
+    new_conn->Abandon();
+    return;
+  }
+  // a dial meant for another node (two nodes announce this node's address): never taken, and the
+  // connections with that peer are left alone
+  if (!new_conn->IsActive() && RefuseMisdirected(conn_pack, new_conn)) {
+    return;
+  }
+
   Guard g(conn_mux_);
   // abandoned by Reset (which holds conn_mux_ while it abandons the dials): never taken
   if (new_conn->IsDropped()) {
@@ -418,6 +548,9 @@ void Host::OnConnected(Packet&& conn_pack, Connection::Ptr new_conn) {
   if (new_conn->IsActive() && remote_node != new_conn->RemoteNode()) {
     const NodeId dialled = new_conn->RemoteNode();
     LOG(DEBUG) << "Dial to " << IdToBase58(dialled) << " answered by " << IdToBase58(remote_node) << ": dropped";
+    if (remote_node == my_id_) {
+      WarnAnnouncedHere(dialled, "this node dialled it and reached itself");
+    }
     new_conn->Abandon();
     AddToUnreachable(dialled);
     ClearSendQueue(dialled);
@@ -443,6 +576,10 @@ void Host::OnConnected(Packet&& conn_pack, Connection::Ptr new_conn) {
 
 void Host::OnConnectionDropped(const NodeId& remote_node, bool active,
                                Connection::DropReason drop_reason, const Connection* conn) {
+  // a dial meant for another node, answered but never taken (RefuseMisdirected)
+  if (conn && conn->IsNotTaken()) {
+    return;
+  }
   Guard g(conn_mux_);
   auto range = connections_.equal_range(remote_node);
   for (auto it = range.first; it != range.second;) {

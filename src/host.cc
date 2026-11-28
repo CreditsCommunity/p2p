@@ -347,10 +347,23 @@ void Host::ScheduleSelfCheck(std::chrono::seconds after) {
 }
 
 void Host::ProbeOwnEndpoint(const NodeEntrance& seen) {
-  if (seen.address.is_unspecified() || seen.tcp_port == 0 || IsEndpointBanned(seen.address, seen.tcp_port)) {
+  if (seen.address.is_unspecified()) {
     return;
   }
-  const std::string key = seen.address.to_string() + ":" + std::to_string(seen.tcp_port);
+  // an official peer records the source port of this node's own connection (UpdateTcpPort), where
+  // nothing listens: the address it saw with the port this node announces is where its peers dial it
+  const uint16_t announced = Network::Instance().GetHostContacts().tcp_port;
+  ProbeEndpoint(seen.address, announced);
+  if (seen.tcp_port != announced) {
+    ProbeEndpoint(seen.address, seen.tcp_port);
+  }
+}
+
+void Host::ProbeEndpoint(const bi::address& address, uint16_t tcp_port) {
+  if (tcp_port == 0 || IsEndpointBanned(address, tcp_port)) {
+    return;
+  }
+  const std::string key = address.to_string() + ":" + std::to_string(tcp_port);
   {
     Guard g(self_check_mux_);
     const auto now = std::chrono::steady_clock::now();
@@ -366,7 +379,7 @@ void Host::ProbeOwnEndpoint(const NodeEntrance& seen) {
   LOG(DEBUG) << "Checking the address a peer records for this node: " << key;
   // not a pending dial: OnConnected recognises it by the id dialled (this node's own)
   auto conn = Connection::Create(static_cast<ConnectionOwner&>(*this), io_);
-  conn->Connect(Connection::Endpoint(seen.address, seen.tcp_port), FormRegistration(my_id_));
+  conn->Connect(Connection::Endpoint(address, tcp_port), FormRegistration(my_id_));
 }
 
 void Host::OnOwnEndpointAnswered(const NodeId& answered_by, const Connection::Ptr& conn) {

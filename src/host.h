@@ -120,6 +120,7 @@ class Host : public RoutingTableEventHandler, public BanManOwner, public Connect
   // it and its peers reach that node instead
   void ScheduleSelfCheck(std::chrono::seconds after);
   void ProbeOwnEndpoint(const NodeEntrance& seen);
+  void ProbeEndpoint(const bi::address&, uint16_t tcp_port);
   void OnOwnEndpointAnswered(const NodeId& answered_by, const Connection::Ptr&);
 
   void RemoveFromPendingConn(const NodeId&);
